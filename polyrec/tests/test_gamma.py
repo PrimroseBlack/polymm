@@ -69,3 +69,42 @@ def test_load_config(tmp_path):
         assert "nonsense" in str(e)
     else:
         raise AssertionError("unknown key accepted")
+
+
+def test_finalizer_logs_result_then_settled_reading(tmp_path, monkeypatch):
+    """Result is logged as soon as it resolves, then once more at the settle delay; nothing in between."""
+    import asyncio
+
+    from polyrec import recorder as rec
+    from polyrec.rawlog import RawLog, iter_raw
+
+    clock = [1_000_000.0]
+
+    async def fake_sleep(d):
+        clock[0] += d
+
+    monkeypatch.setattr(rec.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(rec.time, "time", lambda: clock[0])
+    monkeypatch.setattr(rec.time, "time_ns", lambda: int(clock[0] * 1e9))
+
+    open_ev = load("event_btc_5m_open.json")
+    m = parse_market(open_ev, "btc", "5m")
+    m = type(m)(**{**m.__dict__, "start_ts": 999_700, "end_ts": 1_000_000})
+    asked = []
+
+    class FakeGamma:
+        async def event_by_slug(self, slug):
+            after = clock[0] - m.end_ts
+            asked.append(after)
+            ev = json.loads(json.dumps(open_ev))
+            if after >= 120:  # resolves two minutes after the end
+                ev["markets"][0].update(closed=True, outcomePrices='["1", "0"]', volumeNum=after)
+            return ev
+
+    r = rec.Recorder(Config(data_dir=tmp_path))
+    r.gamma, r.meta = FakeGamma(), RawLog(tmp_path, "meta")
+    asyncio.run(r._finalize(m))
+    r.meta.close()
+    assert asked == [20, 60, 120, 1800]
+    finals = [x for x in iter_raw(tmp_path, "meta", 999_000 * 10**9, 1_010_000 * 10**9) if x["k"] == "final"]
+    assert [x["ev"]["markets"][0]["volumeNum"] for x in finals] == [120, 1800]

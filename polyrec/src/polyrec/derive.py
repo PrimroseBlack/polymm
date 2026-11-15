@@ -520,16 +520,24 @@ def pending_days(cfg: Config) -> list[str]:
     return [d for d in days if day_start(d) <= cutoff and not (root / "derived" / "_done" / f"{d}.json").exists()]
 
 
-def prune(cfg: Config) -> None:
-    """Delete raw day-directories older than the retention window once nothing needs them."""
+def prune(cfg: Config) -> list[str]:
+    """Delete raw logs of days older than the retention window once no derive run needs them.
+
+    A day's raw files feed three runs: the day before (4h windows spill over midnight), the day
+    itself, and the day after (its first markets are recorded from a few minutes before midnight).
+    """
     root = Path(cfg.data_dir)
     done = lambda d: (root / "derived" / "_done" / f"{d}.json").exists()  # noqa: E731
+    has_raw = lambda d: (root / "raw" / "ws" / d).exists()  # noqa: E731
     cutoff = time.time() - cfg.raw_retention_days * 86400
-    for stream_dir in sorted((root / "raw").glob("*")):
-        for p in sorted(stream_dir.glob("????-??-??")):
-            t = day_start(p.name)
-            prev_dir = stream_dir / day_of(t - 86400)
-            # A day's raw files feed three derive runs: the day before (4h spill-over), the day, the day after.
-            if t + 86400 < cutoff and done(p.name) and done(day_of(t + 86400)) and (done(day_of(t - 86400)) or not prev_dir.exists()):
+    days = sorted({p.name for p in (root / "raw").glob("*/????-??-??")})
+    pruned = []
+    for d in days:
+        t = day_start(d)
+        prev, nxt = day_of(t - 86400), day_of(t + 86400)
+        if t + 86400 < cutoff and done(d) and done(nxt) and (done(prev) or not has_raw(prev)):
+            for p in (root / "raw").glob(f"*/{d}"):
                 shutil.rmtree(p)
-                log.info("pruned %s", p)
+            pruned.append(d)
+            log.info("pruned raw logs for %s", d)
+    return pruned

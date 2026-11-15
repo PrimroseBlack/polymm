@@ -201,3 +201,29 @@ def test_report(derived, capsys):
     assert print_report(cfg, DAY) == 0 and "btc-5m" in capsys.readouterr().out
     assert pending_days(cfg) == []  # already derived
     assert (Path(cfg.data_dir) / "derived" / "_done" / f"{DAY}.json").exists()
+
+
+def test_prune_only_removes_days_nothing_still_needs(tmp_path):
+    import time
+
+    from polyrec.derive import prune
+    from polyrec.util import day_of
+
+    now = time.time()
+    day = lambda n: day_of(now - n * 86400)  # noqa: E731
+    cfg = Config(data_dir=tmp_path, raw_retention_days=3)
+    for n in range(0, 9):
+        for stream in ("ws", "rest", "aux_x"):
+            (tmp_path / "raw" / stream / day(n)).mkdir(parents=True)
+    (tmp_path / "derived" / "_done").mkdir(parents=True)
+    for n in (4, 5, 6, 8):  # day 7 was never derived
+        (tmp_path / "derived" / "_done" / f"{day(n)}.json").write_text("{}")
+
+    assert prune(cfg) == [day(5)]
+    left = sorted(p.name for p in (tmp_path / "raw" / "ws").iterdir())
+    # 8: the day after it (7) is not derived.   7: not derived.   6: day 7 before it is not derived.
+    # 5: old enough, and 4, 5, 6 are all derived -> removed from every stream.
+    # 4: day 3 after it is not derived.          3..0: not derived / inside the retention window.
+    assert left == sorted(day(n) for n in (0, 1, 2, 3, 4, 6, 7, 8))
+    assert not (tmp_path / "raw" / "aux_x" / day(5)).exists() and (tmp_path / "raw" / "rest" / day(6)).exists()
+    assert prune(cfg) == []

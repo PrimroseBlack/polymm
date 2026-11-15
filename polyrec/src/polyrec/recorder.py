@@ -19,6 +19,7 @@ from .ws import AuxWS, MarketWS
 log = logging.getLogger(__name__)
 # Seconds after a window ends at which to re-read the market for its official result.
 FINAL_DELAYS = (20, 60, 120, 300, 600, 1800, 3600, 7200)
+SETTLE_DELAY = 1800
 BOOKS_CHUNK = 50
 
 
@@ -150,25 +151,30 @@ class Recorder:
         self.meta.record(time.time_ns(), k=kind, cid=m.condition_id, coin=m.coin, dur=m.duration, slug=m.slug, ev=ev)
 
     async def _finalize(self, m: Market) -> None:
-        """Re-read the market after it ends for the official result, price to beat and final price.
+        """Re-read the market after it ends: once for the result, once more when it has settled.
 
-        Gamma publishes the outcome within seconds, the final price some minutes later, and for
-        some series (4h) no prices at all, so stop waiting for the price after ten minutes.
+        Gamma publishes the outcome within a minute or two, the final price some minutes later,
+        and refreshes volume only in batches, so the reading taken at SETTLE_DELAY is the one
+        with complete numbers. Each reading is logged; the replay uses the last.
         """
-        ev = None
+        ev, resolved = None, False
         for delay in FINAL_DELAYS:
+            if resolved and delay < SETTLE_DELAY:
+                continue
             await asyncio.sleep(max(0.0, m.end_ts + delay - time.time()))
             try:
                 ev = await self.gamma.event_by_slug(m.slug)
             except Exception as e:  # noqa: BLE001
                 log.warning("re-reading %s for result failed: %s", m.slug, e)
                 continue
-            has_price = ev and (ev.get("eventMetadata") or {}).get("finalPrice") is not None
-            if ev and official_outcome(ev) and (has_price or delay >= 600):
+            if ev and official_outcome(ev):
                 self._meta("final", m, ev)
-                return
-        log.warning("%s still unresolved %ds after its end", m.slug, FINAL_DELAYS[-1])
-        self._meta("final_timeout", m, ev)
+                resolved = True
+                if delay >= SETTLE_DELAY:
+                    return
+        if not resolved:
+            log.warning("%s still unresolved %ds after its end", m.slug, FINAL_DELAYS[-1])
+            self._meta("final_timeout", m, ev)
 
     # -- housekeeping -----------------------------------------------------------------------
 

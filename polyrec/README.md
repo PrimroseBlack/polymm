@@ -112,7 +112,7 @@ seed/kacho/<coin>_{markets,ticks}.parquet
 |---|---|
 | `outcome` | Official result, `Up` / `Down`, read from Polymarket after resolution. Null if unresolved. |
 | `price_to_beat`, `final_price` | The reference price at window start and end. Polymarket publishes these only **after** the window ends, and not at all for 4h markets. |
-| `volume` | USDC volume at resolution. |
+| `volume` | USDC volume as Polymarket reports it 30 minutes after the window (it updates this figure in batches, so earlier readings are too low). |
 | `tick_size`, `fee_rate`, `resolution_source` | As listed when the market was discovered. |
 | `n_ticks_window` / `expected_ticks` | Seconds of the window that have a tick / seconds in the window. |
 | `rest_ticks` | Ticks that came from REST snapshots because the websocket was down. |
