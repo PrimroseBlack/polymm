@@ -11,7 +11,8 @@ from pathlib import Path
 import httpx
 import orjson
 
-from .config import Config, series_slug
+from .chainlink import PolyBoltWS
+from .config import CRED_VARS, Config, clob_creds, series_slug
 from .gamma import Gamma, Market, official_outcome, parse_market
 from .rawlog import RawLog, compress_leftovers, embed
 from .ws import AuxWS, MarketWS
@@ -237,6 +238,13 @@ class Recorder:
             lg = RawLog(self.root, f"aux_{feed.name}")
             self.logs.append(lg)
             self.aux.append(AuxWS(feed.name, feed.url, feed.subscribe, lg, feed.stale_seconds))
+        creds = clob_creds() if cfg.chainlink else None
+        if creds:
+            lg = RawLog(self.root, "chainlink")
+            self.logs.append(lg)
+            self.aux.append(PolyBoltWS(cfg.polybolt_url, creds, cfg.coins, lg))
+        elif cfg.chainlink:
+            log.warning("Chainlink prices are NOT being recorded: set %s (see README)", ", ".join(CRED_VARS))
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

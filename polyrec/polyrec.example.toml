@@ -18,6 +18,11 @@ ws_stale_seconds = 30.0           # reconnect after this long without data
 depth_levels = 10             # order-book levels per side in the 1 Hz table
 raw_retention_days = 14       # raw logs are deleted this long after they have been derived
 
+# Chainlink prices (what the markets settle on). Recorded when the three POLYMARKET_API_*
+# variables are set, normally in env_file; see "Chainlink prices" in the README.
+chainlink = true
+env_file = "/etc/polyrec.env"
+
 # Reference-price feeds, recorded verbatim. Delete these blocks to disable them,
 # or point them elsewhere. `polyrec smoke` tells you whether they work from your host.
 [[aux_feeds]]

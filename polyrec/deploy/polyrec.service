@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 User=polyrec
 WorkingDirectory=/opt/polyrec
+# Optional credentials for the Chainlink feed (see README); the leading "-" makes it optional.
+EnvironmentFile=-/etc/polyrec.env
 ExecStart=/opt/polyrec/.venv/bin/polyrec -c /etc/polyrec.toml record
 Restart=always
 RestartSec=2

@@ -11,7 +11,8 @@ import orjson
 from websockets.asyncio.client import connect
 
 from .book import Book
-from .config import Config, series_slug
+from .chainlink import AuthFailed, authenticate, parse_polybolt, subscriptions
+from .config import Config, clob_creds, series_slug
 from .derive import parse_ref
 from .gamma import Gamma, parse_market
 
@@ -128,6 +129,33 @@ async def smoke(cfg: Config, seconds: int = 20) -> int:
             check(f"aux feed {feed.name}", parsed > 0, f"{n} messages, {parsed} parsed as prices", required=False)
         except Exception as e:  # noqa: BLE001
             check(f"aux feed {feed.name}", False, repr(e), required=False)
+
+    # Chainlink prices: optional, needs credentials.
+    creds = clob_creds() if cfg.chainlink else None
+    if cfg.chainlink and not creds:
+        check("Chainlink feed", False, "skipped: no API credentials found (see README)", required=False)
+    elif creds:
+        try:
+            got: Counter = Counter()
+            async with connect(cfg.polybolt_url, ping_interval=None, max_size=None, open_timeout=15) as ws:
+                await authenticate(ws, creds)
+                await ws.send(orjson.dumps({"op": "subscribe", "rid": "s1", "subscriptions": subscriptions(["btc"])}).decode())
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < 10 and not (got["chainlink"] and got["chainlink_twap"]):
+                    try:
+                        msg = orjson.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+                    except asyncio.TimeoutError:
+                        continue
+                    if msg.get("op") == "error":
+                        got[f"error:{msg.get('code')}"] += 1
+                    for _, feed, _, _, snap in parse_polybolt(msg):
+                        got[feed] += not snap
+            ok = bool(got["chainlink"] and got["chainlink_twap"])
+            check("Chainlink feed", ok, ", ".join(f"{k}={v}" for k, v in got.items()) or "no prices in 10s", required=False)
+        except AuthFailed as e:
+            check("Chainlink feed", False, f"credentials rejected ({e})", required=False)
+        except Exception as e:  # noqa: BLE001
+            check("Chainlink feed", False, repr(e), required=False)
 
     failed = [n for n, ok, _, req in results if req and not ok]
     print("\nRESULT:", "all required checks passed" if not failed else f"FAILED: {', '.join(failed)}")

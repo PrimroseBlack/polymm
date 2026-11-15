@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
+import os
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+CRED_VARS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
 
 COINS = ("btc", "eth", "sol", "xrp", "doge", "hype", "bnb")
 DURATIONS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
@@ -59,6 +64,10 @@ class Config:
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
     data_api_url: str = "https://data-api.polymarket.com"
+    # Chainlink prices (the settlement feed). Recorded when API credentials are available.
+    chainlink: bool = True
+    polybolt_url: str = "wss://ws-live-v2.polymarket.com/ws"
+    env_file: str = "/etc/polyrec.env"  # KEY=VALUE file holding the credentials
     aux_feeds: list = field(default_factory=lambda: list(DEFAULT_AUX))
 
     @property
@@ -90,3 +99,28 @@ def load_config(path: str | Path | None = None) -> Config:
     if bad:
         raise ValueError(f"unknown durations {bad}; choose from {list(DURATIONS)}")
     return cfg
+
+
+def load_env_file(path: str | Path) -> bool:
+    """Read KEY=VALUE lines into the environment (existing variables win). True if the file was read."""
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        log.warning("cannot read %s (permission denied): credentials in it are not available", path)
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+    return True
+
+
+def clob_creds():
+    """CLOB API credentials from the environment, or None unless all three are set."""
+    from .chainlink import ClobCreds
+
+    values = [os.environ.get(v, "").strip() for v in CRED_VARS]
+    return ClobCreds(*values) if all(values) else None

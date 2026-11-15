@@ -97,8 +97,8 @@ class MarketWS:
         async for msg in ws:
             ns = time.time_ns()
             self.last_rx_ns = ns
-            if msg in ("PONG", b"PONG"):
-                continue
+            if len(msg) <= 8 and msg[:1] not in ("{", "[", b"{", b"["):
+                continue  # keepalive text (PONG and variants): proves the link, carries no data
             self.last_data_ns = ns
             self.n_msgs += 1
             self.log.write(embed(ns, extra, msg), ns)

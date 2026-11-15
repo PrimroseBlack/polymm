@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .book import NAN, Book
+from .chainlink import parse_polybolt
 from .config import DURATIONS, Config
 from .gamma import Market, official_outcome, parse_market
 from .rawlog import iter_raw
@@ -41,7 +42,7 @@ TICKS = pa.schema(
      ("su", F8), ("sau", F8), ("sd", F8), ("sad", F8),
      ("du", F8), ("dau", F8), ("dd", F8), ("dad", F8),
      ("bid_px", pa.list_(F8)), ("bid_sz", pa.list_(F8)), ("ask_px", pa.list_(F8)), ("ask_sz", pa.list_(F8)),
-     ("src", pa.int8()), ("age_ms", I8)]
+     ("src", pa.int8()), ("age_ms", I8), ("cl", F8), ("cl_twap", F8)]
 )  # fmt: skip
 L2 = pa.schema(
     [("r", I8), ("ts_ms", I8), ("condition_id", pa.string()), ("outcome", pa.string()),
@@ -62,7 +63,10 @@ MARKETS = pa.schema(
      ("n_trades", I8), ("n_l2", I8), ("rest_checks", I8), ("rest_mismatches", I8),
      ("ws_outcome", pa.string())]
 )  # fmt: skip
-REF = pa.schema([("r", I8), ("ts_ms", I8), ("feed", pa.string()), ("symbol", pa.string()), ("price", F8)])
+REF = pa.schema(
+    [("r", I8), ("ts_ms", I8), ("feed", pa.string()), ("symbol", pa.string()), ("price", F8), ("snapshot", pa.int8())]
+)
+CL_FRESH_NS = 30 * NS  # a Chainlink value older than this is not attached to a tick
 
 # l2.kind
 DELTA, LEVEL, RESET, DESYNC = 0, 1, 2, 3
@@ -197,6 +201,8 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
     ws_connected = False
     last_ws_ns = 0
     stats = {"ws_records": 0, "rest_records": 0, "deltas_skipped": 0, "disconnects": 0}
+    cl_last: dict[str, tuple[int, float]] = {}  # coin -> (receive ns, Chainlink price)
+    twap_last: dict[str, tuple[int, float]] = {}
 
     def desync(ns: int) -> None:
         for ms in live:
@@ -229,9 +235,12 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
         rest = (uu and not (up.synced and ws_live)) or (ud and not (dn.synced and ws_live))
         age = (tns - max(up.upd_ns if uu else 0, dn.upd_ns if ud else 0)) // 1_000_000
         sec = t - ms.m.start_ts
+        cl, tw = cl_last.get(ms.m.coin), twap_last.get(ms.m.coin)
+        cl = cl[1] if cl and tns - cl[0] < CL_FRESH_NS else None
+        tw = tw[1] if tw and tns - tw[0] < CL_FRESH_NS else None
         for col, v in zip(
             ms.rows,
-            (t, t, sec, bu, au, bd, ad, su, sau, sd, sad, du, dau, dd, dad, bp, bs, ap, az, int(rest), age),
+            (t, t, sec, bu, au, bd, ad, su, sau, sd, sad, du, dau, dd, dad, bp, bs, ap, az, int(rest), age, cl, tw),
         ):
             col.append(v)
         ms.n_ticks += 1
@@ -362,12 +371,22 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
             snapshot(ms, b, "Up" if is_up else "Down", bids, asks, r, ts, rest=True)
             b.rest_ns, b.base_ts, b.synced = r, ts, ws_live
 
+    def on_chainlink(rec: dict) -> None:
+        msg = rec.get("m")
+        if isinstance(msg, dict):
+            for _, feed, symbol, price, _ in parse_polybolt(msg)[-1:]:  # the newest point
+                if feed == "chainlink_twap":
+                    twap_last[symbol.removesuffix("usd")] = (rec["r"], price)
+                elif feed == "chainlink":
+                    cl_last[symbol.removesuffix("usd")] = (rec["r"], price)
+
     if states:
         t_begin = states[0].m.start_ts - lead
         t_end = max(ms.m.end_ts for ms in states) + cfg.linger_seconds + 5
         merged = heapq.merge(
             ((rec["r"], 0, rec) for rec in iter_raw(root, "ws", t_begin * NS, t_end * NS)),
             ((rec["r"], 1, rec) for rec in iter_raw(root, "rest", t_begin * NS, t_end * NS)),
+            ((rec["r"], 2, rec) for rec in iter_raw(root, "chainlink", t_begin * NS, t_end * NS)),
             key=lambda x: x[0],
         )
         next_t = t_begin
@@ -379,9 +398,11 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
             if which == 0:
                 stats["ws_records"] += 1
                 on_ws(rec)
-            else:
+            elif which == 1:
                 stats["rest_records"] += 1
                 on_rest(rec)
+            else:
+                on_chainlink(rec)
         for ms in live:
             finish(ms)
 
@@ -459,15 +480,27 @@ def parse_ref(msg) -> tuple[int, str, float] | None:
 
 
 def derive_ref(cfg: Config, day: str) -> int:
+    """Reference prices received on `day`: Chainlink (via PolyBolt) and the auxiliary feeds."""
     root = Path(cfg.data_dir)
     d0 = day_start(day)
     sink = Sink(root / "derived" / "ref" / f"date={day}" / "ref.parquet", REF)
+    newest: dict[tuple[str, str], int] = {}
+    for rec in iter_raw(root, "chainlink", d0 * NS, (d0 + 86400) * NS):
+        if not isinstance(rec.get("m"), dict):
+            continue
+        for ts, feed, symbol, price, snap in parse_polybolt(rec["m"]):
+            key = (feed, symbol)
+            # A snapshot repeats the last two minutes: keep only points that fill a gap.
+            if snap and ts <= newest.get(key, 0):
+                continue
+            newest[key] = max(ts, newest.get(key, 0))
+            sink.add(rec["r"], ts, feed, symbol, price, snap)
     for stream_dir in sorted((root / "raw").glob("aux_*")):
         feed = stream_dir.name[4:]
         for rec in iter_raw(root, stream_dir.name, d0 * NS, (d0 + 86400) * NS):
             hit = parse_ref(rec["m"]) if isinstance(rec.get("m"), dict) else None
             if hit:
-                sink.add(rec["r"], hit[0], feed, hit[1], hit[2])
+                sink.add(rec["r"], hit[0], feed, hit[1], hit[2], 0)
     sink.close()
     return sink.rows
 

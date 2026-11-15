@@ -23,6 +23,7 @@ class FakeMarketServer:
             if raw == "PING":
                 self.frames.append((n, "PING"))
                 await ws.send("PONG")
+                await ws.send("pong")  # servers have been seen to vary the keepalive text
                 continue
             msg = json.loads(raw)
             self.frames.append((n, msg))

@@ -18,7 +18,7 @@ id polyrec >/dev/null 2>&1 || useradd --system --home-dir "$APP" --shell /usr/sb
 mkdir -p "$APP" "$DATA"
 python3 -m venv "$APP/.venv"
 "$APP/.venv/bin/pip" install --quiet --upgrade pip
-"$APP/.venv/bin/pip" install --quiet --upgrade "$REPO"
+"$APP/.venv/bin/pip" install --quiet --upgrade "$REPO[creds]"
 
 if [ ! -f /etc/polyrec.toml ]; then
   cp "$REPO/polyrec.example.toml" /etc/polyrec.toml
@@ -33,5 +33,6 @@ systemctl daemon-reload
 echo
 echo "Installed. Next:"
 echo "  sudo -u polyrec $APP/.venv/bin/polyrec -c /etc/polyrec.toml smoke     # check the feeds from this host"
+echo "  (optional, for Chainlink prices: see 'Chainlink prices' in the README)"
 echo "  systemctl enable --now polyrec.service polyrec-derive.timer          # start recording"
 echo "  journalctl -u polyrec -f                                             # watch it"

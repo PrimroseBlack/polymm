@@ -4,8 +4,8 @@ Records Polymarket's crypto **Up or Down** markets so that trading bots can be b
 
 - **Coins:** BTC, ETH, SOL, XRP, DOGE, HYPE, BNB
 - **Windows:** 5 minutes, 15 minutes, 1 hour, 4 hours (28 market series)
-- **What is kept:** every order-book message, every trade print, official results, and
-  1-second reference prices, plus a ready-made one-row-per-second table.
+- **What is kept:** every order-book message, every trade print, official results, the
+  Chainlink prices the markets settle on, and a ready-made one-row-per-second table.
 
 Polymarket deletes a market's order book the moment its window closes, so this history can only
 be captured live. Trades and results can be fetched afterwards (`polyrec backfill`).
@@ -21,7 +21,8 @@ which `polyrec seed-kacho` downloads as a historical seed.
 Gamma API ──────▶│ discovery: current + next windows of all 28 series, every 30 s │
 market websocket▶│ every message, verbatim, with a nanosecond receive time       │──▶ data/raw/*.jsonl(.zst)
 CLOB REST /books▶│ snapshot every 30 s as a cross-check; every 1 s if the socket  │
-Binance sockets ▶│ stops delivering. Reference prices recorded verbatim.          │
+Chainlink feed  ▶│ stops delivering. Chainlink and Binance prices, verbatim.      │
+Binance sockets ▶│                                                                │
                  └───────────────────────────────────────────────────────────────┘
                  ┌────────────── polyrec derive (daily timer) ───────────────────┐
 data/raw ───────▶│ replays the raw logs into Parquet: markets, ticks, l2, trades  │──▶ data/derived/
@@ -38,11 +39,11 @@ Needs Python 3.11+ (Ubuntu 24.04 or Debian 12). 2 vCPU / 2 GB RAM is plenty; see
 [Disk](#disk) for storage.
 
 ```bash
-git clone <this repository> polymarket-crypto-recorder
+git clone -b polyrec https://github.com/PrimroseBlack/polymm
 ```
 
 ```bash
-sudo bash polymarket-crypto-recorder/deploy/install.sh
+sudo bash polymm/polyrec/deploy/install.sh
 ```
 
 ```bash
@@ -55,6 +56,7 @@ sudo systemctl enable --now polyrec.service polyrec-derive.timer
 
 `smoke` takes about 40 seconds and prints PASS/FAIL per feed. **Run it before starting the
 service** — see [What has and has not been verified](#what-has-and-has-not-been-verified).
+For Chainlink prices, add credentials first: see [Chainlink prices](#chainlink-prices).
 
 Day to day:
 
@@ -74,6 +76,40 @@ sudo -u polyrec /opt/polyrec/.venv/bin/polyrec -c /etc/polyrec.toml report --dat
 wired into any monitor. Settings live in `/etc/polyrec.toml`
 ([all options](polyrec.example.toml)); restart the service after editing.
 
+## Chainlink prices
+
+The 5m, 15m and 4h markets settle on a 60-second average of Chainlink's price. Polymarket
+streams that feed only to clients holding CLOB API credentials (an API key, secret and
+passphrase tied to a wallet). Without them the recorder runs normally, skips this feed, and
+says so in its log at startup.
+
+On the VPS, after `install.sh`:
+
+```bash
+sudo /opt/polyrec/.venv/bin/polyrec clob-creds --out /etc/polyrec.env
+```
+
+```bash
+sudo chown root:polyrec /etc/polyrec.env && sudo chmod 640 /etc/polyrec.env
+```
+
+```bash
+sudo systemctl restart polyrec
+```
+
+`clob-creds` creates a brand-new, empty wallet just for the recorder, asks Polymarket for API
+credentials for it, writes them to the file, and discards the wallet's key. Nothing of value is
+tied to those credentials. Then run `smoke` again: it reports whether the Chainlink feed works.
+
+If Polymarket rejects credentials from a wallet that has never traded (not verified either
+way), use your trading wallet instead: `clob-creds --prompt` asks for its private key with
+hidden input, uses it once in memory to sign Polymarket's login message, and stores only the
+resulting API credentials. Those cannot place orders or move funds, but they do open that
+account's private API, so keep `/etc/polyrec.env` private.
+
+What gets recorded: the live Chainlink price and its 60-second average for all seven coins,
+about once a second each. They appear as `cl` and `cl_twap` in `ticks` and as rows in `ref`.
+
 ## Commands
 
 | Command | What it does |
@@ -86,13 +122,14 @@ wired into any monitor. Settings live in `/etc/polyrec.toml`
 | `polyrec prune` | Deletes raw logs older than `raw_retention_days` that are already derived. |
 | `polyrec backfill --start D --end D` | Downloads results and trades for past markets. `--coins`, `--durations`, `--no-trades` narrow it. Resumable. |
 | `polyrec seed-kacho` | Downloads Kacho's dataset (~725 MB) into `data/seed/kacho/`. |
+| `polyrec clob-creds` | Creates the API credentials the Chainlink feed needs. |
 
 ## The data
 
 Everything is under `data_dir`. Times are UTC. A market belongs to the day its window **starts**.
 
 ```
-raw/<stream>/<YYYY-MM-DD>/<stream>-<YYYYMMDD>T<HH>.jsonl[.zst]   ws, rest, meta, aux_<feed>
+raw/<stream>/<YYYY-MM-DD>/<stream>-<YYYYMMDD>T<HH>.jsonl[.zst]   ws, rest, meta, chainlink, aux_<feed>
 derived/markets/date=YYYY-MM-DD/markets.parquet
 derived/ticks/date=YYYY-MM-DD/ticks.parquet
 derived/l2/date=YYYY-MM-DD/l2.parquet
@@ -136,6 +173,8 @@ has no row.
 | `bid_px` `bid_sz` `ask_px` `ask_sz` | Top `depth_levels` levels of the **Up** book, best first. The Down book is its mirror image (Down bid at p = Up ask at 1 − p). |
 | `src` | 0 = live websocket book, 1 = REST snapshot. |
 | `age_ms` | Milliseconds since the book last changed. |
+| `cl` | Chainlink price of the coin, as last received before `t`. Null if nothing arrived in the previous 30 s (or the feed is not configured). |
+| `cl_twap` | Chainlink's 60-second average, same rules. At a window's start it is that window's price to beat; at its end, the settlement price. |
 
 `bu au bd ad su sd sau sad du dd` have the same meaning as in Kacho's dataset. NaN means that
 side of the book was empty.
@@ -159,9 +198,17 @@ For event-level backtests. Per token (`condition_id` + `outcome`), in receive or
 `trades`: `r`, `ts_ms`, `condition_id`, `coin`, `duration`, `outcome`, `side`, `price`, `size`,
 `fee_rate_bps`, `tx_hash` — one row per trade print.
 
-`ref`: `r`, `ts_ms`, `feed`, `symbol`, `price` — 1-second Binance closes (spot for six coins,
-futures mark price for HYPE). These are a convenience signal, **not** the settlement price:
-5m/15m/4h markets settle on a 60-second Chainlink average, hourly markets on the Binance 1h candle.
+`ref`: `r`, `ts_ms`, `feed`, `symbol`, `price`, `snapshot` — every reference price received.
+
+| `feed` | What it is |
+|---|---|
+| `chainlink` | Live Chainlink price (`btcusd`, …). |
+| `chainlink_twap` | Its 60-second average: what 5m, 15m and 4h markets settle on. |
+| `binance_spot` | 1-second Binance closes for six coins (`BTCUSDT`, …). Hourly markets settle on the Binance 1h candle. |
+| `binance_futures` | Binance futures mark price for HYPE. |
+
+`snapshot` = 1 marks points the Chainlink feed replayed after a reconnect to fill a gap: their
+`ts_ms` is when they happened, `r` is when they were received.
 
 ### Querying
 
@@ -198,7 +245,9 @@ This was built in a sandbox that cannot open websocket connections, so:
 | Discovery of all 28 series, REST snapshots, results, the replay into tables | Run against live Polymarket data. |
 | Backfill of results and trades | Run against live Polymarket data. |
 | Websocket client (subscribe, heartbeat, reconnect, stall detection) | Tested against a local stand-in server that follows Polymarket's documented protocol. **Not yet run against Polymarket itself.** |
-| Binance reference feeds | Written from the documented message formats. **Not yet run.** If one fails, the recorder logs it and carries on. |
+| Chainlink feed | Tested against a local stand-in that follows Polymarket's documented protocol (login, subscribe, snapshots, updates). **Not yet run against Polymarket itself.** If it fails, the recorder logs it and carries on. |
+| `clob-creds` | The wallet signature is tested; the request to Polymarket that issues the credentials has **not been run**. |
+| Binance reference feeds | Written from memory of Binance's message formats. **Not yet run.** If one fails, the recorder logs it and carries on. |
 | `seed-kacho` download, `deploy/install.sh` | Not run end to end. |
 
 `polyrec smoke` exercises the unverified feeds in under a minute.

@@ -100,7 +100,24 @@ def derived(tmp_path_factory):
     aux.record(ns(5), m={"stream": "btcusdt@kline_1s", "data": {"e": "kline", "E": 1, "s": "BTCUSDT", "k": {
         "t": 1000, "T": 1999, "s": "BTCUSDT", "i": "1s", "o": "1", "c": "65001.5", "h": "1", "l": "1", "x": True}}})  # fmt: skip
     aux.record(ns(6), ctl="connected")
-    for lg in (ws, rest, meta, aux):
+
+    # Chainlink via PolyBolt: snapshot, live price, 60 s average, another coin, a reconnect snapshot.
+    cl = RawLog(root, "chainlink")
+
+    def env(channel, payload, snap=False):
+        return {"v": 1, "channel": channel, "seq": 1, "ts": 1, "payload": payload, **({"snapshot": True} if snap else {})}
+
+    def pt(ts, value):
+        return {"timestamp": ts, "value": value, "full_accuracy_value": f"{value:.8f}"}
+
+    cl.record(ns(1), ctl="connected")
+    cl.record(ns(1.1), m={"op": "subscribed", "channel": "price.crypto", "rid": "s1"})
+    cl.record(ns(1.2), m=env("price.crypto", {"symbol": "btcusd", "source": "chainlink", "data": [pt(900, 65000.0), pt(1000, 65005.0)]}, snap=True))
+    cl.record(ns(5.5), m=env("price.crypto", {"symbol": "btcusd", "source": "chainlink", **pt(5500, 65010.5)}))
+    cl.record(ns(6.5), m=env("price.crypto.twap", {"symbol": "btcusd", "source": "chainlink", "window_seconds": 60, **pt(6500, 65002.25)}))
+    cl.record(ns(7), m=env("price.crypto", {"symbol": "ethusd", "source": "chainlink", **pt(7000, 3000.0)}))
+    cl.record(ns(9), m=env("price.crypto", {"symbol": "btcusd", "source": "chainlink", "data": [pt(5500, 65010.5), pt(8000, 65020.0)]}, snap=True))
+    for lg in (ws, rest, meta, aux, cl):
         lg.close()
 
     cfg = Config(data_dir=root)
@@ -184,8 +201,30 @@ def test_l2_replays_to_the_same_books(derived):
     assert ns(107.1) not in at  # an unchanged snapshot adds no rows
 
 
+def test_chainlink_columns_are_causal_and_expire(derived):
+    cl = {sec: (tick(derived, sec)["cl"], tick(derived, sec)["cl_twap"]) for sec in (1, 2, 6, 7, 10, 36, 37, 38, 39)}
+    assert cl[1] == (None, None)  # the snapshot arrived at 1.2, after instant 1
+    assert cl[2] == (65005.0, None)  # newest point of the snapshot
+    assert cl[6] == (65010.5, None) and cl[7] == (65010.5, 65002.25)  # ETH's price is not attached to BTC
+    assert cl[10] == (65020.0, 65002.25)
+    assert cl[36] == (65020.0, 65002.25) and cl[37] == (65020.0, None)  # average last heard at 6.5
+    assert cl[38] == (65020.0, None) and cl[39] == (None, None)  # price last heard at 9.0
+
+
 def test_reference_prices(derived):
-    assert derived[2]["ref"] == [{"r": ns(5), "ts_ms": 1999, "feed": "binance_spot", "symbol": "BTCUSDT", "price": 65001.5}]
+    ref = derived[2]["ref"]
+    assert [r for r in ref if r["feed"] == "binance_spot"] == [
+        {"r": ns(5), "ts_ms": 1999, "feed": "binance_spot", "symbol": "BTCUSDT", "price": 65001.5, "snapshot": 0}
+    ]
+    got = [(r["feed"], r["symbol"], r["ts_ms"], r["price"], r["snapshot"]) for r in ref if r["feed"] != "binance_spot"]
+    assert got == [
+        ("chainlink", "btcusd", 900, 65000.0, 1),
+        ("chainlink", "btcusd", 1000, 65005.0, 1),
+        ("chainlink", "btcusd", 5500, 65010.5, 0),
+        ("chainlink_twap", "btcusd", 6500, 65002.25, 0),
+        ("chainlink", "ethusd", 7000, 3000.0, 0),
+        ("chainlink", "btcusd", 8000, 65020.0, 1),  # the reconnect snapshot adds only the point not yet seen
+    ]
     assert parse_ref({"e": "markPriceUpdate", "E": 7, "s": "HYPEUSDT", "p": "31.5"}) == (7, "HYPEUSDT", 31.5)
     assert parse_ref({"e": "kline", "s": "X", "k": {"T": 1, "c": "1", "x": False}}) is None  # candle still open
     assert parse_ref({"result": None, "id": 1}) is None

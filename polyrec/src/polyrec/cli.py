@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from .config import load_config
+from .config import load_config, load_env_file
 
 
 def main(argv=None) -> int:
@@ -43,6 +43,13 @@ def main(argv=None) -> int:
     s = sub.add_parser("seed-kacho", help="download Kacho's Mar-May 2026 dataset as a historical seed")
     s.add_argument("--markets-only", action="store_true")
 
+    s = sub.add_parser("clob-creds", help="create the API credentials the Chainlink feed needs")
+    s.add_argument("--out", default="polyrec.env", help="file to write (default: ./polyrec.env)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--key-env", metavar="VAR", help="use an existing wallet: private key in this environment variable")
+    g.add_argument("--prompt", action="store_true", help="use an existing wallet: type its private key (hidden)")
+    s.add_argument("--force", action="store_true", help="replace the output file if it exists")
+
     a = p.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if a.verbose else logging.INFO,
@@ -51,6 +58,8 @@ def main(argv=None) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
     cfg = load_config(a.config)
+    for env_path in (cfg.env_file, "polyrec.env"):
+        load_env_file(env_path)
 
     if a.cmd == "record":
         from .recorder import Recorder
@@ -98,6 +107,10 @@ def main(argv=None) -> int:
         from .backfill import backfill
 
         return backfill(cfg, a.start, a.end, a.coins, a.durations, trades=not a.no_trades)
+    if a.cmd == "clob-creds":
+        from .creds import clob_creds_cmd
+
+        return clob_creds_cmd(cfg, a.out, a.key_env, a.prompt, a.force)
     if a.cmd == "seed-kacho":
         from .backfill import seed_kacho
 
