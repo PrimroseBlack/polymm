@@ -1,0 +1,10 @@
+[Unit]
+Description=polyrec daily derive
+
+[Timer]
+# A day is complete once its last 4h window has ended and results are published (~06:30 UTC next day).
+OnCalendar=*-*-* 07:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=polyrec: build Parquet tables from raw logs, then prune old raw logs
+
+[Service]
+Type=oneshot
+User=polyrec
+WorkingDirectory=/opt/polyrec
+Nice=15
+ExecStart=/opt/polyrec/.venv/bin/polyrec -c /etc/polyrec.toml derive --pending
+ExecStart=/opt/polyrec/.venv/bin/polyrec -c /etc/polyrec.toml prune

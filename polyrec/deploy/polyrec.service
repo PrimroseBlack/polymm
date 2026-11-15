@@ -1,0 +1,15 @@
+[Unit]
+Description=polyrec recorder (Polymarket crypto up/down markets)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=polyrec
+WorkingDirectory=/opt/polyrec
+ExecStart=/opt/polyrec/.venv/bin/polyrec -c /etc/polyrec.toml record
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
