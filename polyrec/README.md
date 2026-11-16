@@ -29,6 +29,10 @@ data/raw ───────▶│ replays the raw logs into Parquet: markets,
                  └───────────────────────────────────────────────────────────────┘
 ```
 
+The markets are spread over several websocket connections (`ws_connections`, default 4):
+Polymarket drops a client that falls behind on a busy connection, and with the load split a
+drop interrupts only that connection's markets, which REST snapshots cover until it is back.
+
 The recorder does no parsing: it writes what it receives and nothing else, so a parsing bug can
 never lose data. Tables can be rebuilt from the raw logs at any time while those are retained
 (3 days by default).

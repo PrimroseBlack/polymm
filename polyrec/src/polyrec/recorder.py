@@ -15,7 +15,7 @@ from .chainlink import PolyBoltWS
 from .config import CRED_VARS, Config, clob_creds, series_slug
 from .gamma import Gamma, Market, official_outcome, parse_market
 from .rawlog import RawLog, compress_leftovers, embed
-from .ws import AuxWS, MarketWS
+from .ws import AuxWS, MarketFeed
 
 log = logging.getLogger(__name__)
 # Seconds after a window ends at which to re-read the market for its official result.
@@ -25,11 +25,12 @@ BOOKS_CHUNK = 50
 
 
 class BookPoller:
-    """POST /books for all active tokens: every checkpoint interval, or every second in fallback."""
+    """POST /books: every active token at the checkpoint interval as a cross-check, and every
+    second for the tokens whose websocket connection is not delivering (fallback)."""
 
-    def __init__(self, client: httpx.AsyncClient, cfg: Config, rawlog: RawLog, get_tokens, ws_healthy):
+    def __init__(self, client: httpx.AsyncClient, cfg: Config, rawlog: RawLog, get_tokens, get_unhealthy):
         self.client, self.cfg, self.log = client, cfg, rawlog
-        self.get_tokens, self.ws_healthy = get_tokens, ws_healthy
+        self.get_tokens, self.get_unhealthy = get_tokens, get_unhealthy
         self.fallback = False
         self.n_ok = self.n_fail = 0
 
@@ -37,19 +38,21 @@ class BookPoller:
         next_checkpoint = 0.0
         while True:
             t = time.monotonic()
-            fallback = not self.ws_healthy()
+            unhealthy = self.get_unhealthy()
+            fallback = bool(unhealthy)
             if fallback != self.fallback:
                 self.fallback = fallback
-                log.warning("REST fallback %s", "ON (websocket not delivering)" if fallback else "off")
-            if fallback or t >= next_checkpoint:
-                if t >= next_checkpoint:
-                    next_checkpoint = t + self.cfg.rest_checkpoint_interval
-                await self.poll(fallback)
+                log.warning("REST fallback %s", f"ON for {len(unhealthy)} tokens" if fallback else "off")
+            if t >= next_checkpoint:
+                next_checkpoint = t + self.cfg.rest_checkpoint_interval
+                await self.poll(self.get_tokens(), False)
+            elif fallback:
+                await self.poll(unhealthy, True)
             spent = time.monotonic() - t
             await asyncio.sleep(max(0.05, self.cfg.rest_fallback_interval - spent) if fallback else 0.25)
 
-    async def poll(self, fallback: bool) -> None:
-        tokens = sorted(self.get_tokens())
+    async def poll(self, tokens, fallback: bool) -> None:
+        tokens = sorted(tokens)
         chunks = [tokens[i : i + BOOKS_CHUNK] for i in range(0, len(tokens), BOOKS_CHUNK)]
         await asyncio.gather(*(self._one(c, fallback) for c in chunks))
 
@@ -84,6 +87,13 @@ class Recorder:
     def tokens(self) -> set[str]:
         return {t for m in self.active.values() for t in m.tokens}
 
+    def shard_of(self, m: Market) -> int:
+        """Connection a market is pinned to. Ordering by duration first spreads each coin's
+        markets (and so the busiest ones, BTC and ETH) across different connections."""
+        cfg = self.cfg
+        i = cfg.durations.index(m.duration) * len(cfg.coins) + cfg.coins.index(m.coin)
+        return i % cfg.ws_connections
+
     def refresh_active(self) -> None:
         now, cfg = time.time(), self.cfg
         self.active = {
@@ -93,7 +103,10 @@ class Recorder:
         }
         for cid in [c for c, m in self.markets.items() if now > m.end_ts + cfg.linger_seconds + 60]:
             del self.markets[cid]
-        self.ws.set_tokens(self.tokens())
+        by_shard: dict[int, set[str]] = {}
+        for m in self.active.values():
+            by_shard.setdefault(self.shard_of(m), set()).update(m.tokens)
+        self.ws.set_tokens(by_shard)
 
     # -- discovery --------------------------------------------------------------------------
 
@@ -179,8 +192,16 @@ class Recorder:
 
     # -- housekeeping -----------------------------------------------------------------------
 
+    async def lag_loop(self) -> None:
+        """Measure how late the event loop wakes a 50 ms sleeper: a stalled loop cannot read sockets."""
+        self.lag_max = 0.0
+        while True:
+            t = time.monotonic()
+            await asyncio.sleep(0.05)
+            self.lag_max = max(self.lag_max, time.monotonic() - t - 0.05)
+
     async def housekeeping_loop(self) -> None:
-        last_log, last_msgs = time.monotonic(), 0
+        last_log, last_msgs, last_bytes, last_cpu, last_conn = time.monotonic(), 0, 0, time.process_time(), 0
         while True:
             await asyncio.sleep(1)
             self.refresh_active()
@@ -188,17 +209,24 @@ class Recorder:
                 lg.flush()
             if int(time.time()) % 5 == 0:
                 self.write_status()
-            if time.monotonic() - last_log >= 60:
+            dt = time.monotonic() - last_log
+            if dt >= 60:
                 log.info(
-                    "ws=%s msgs/min=%d active=%d rest ok/fail=%d/%d fallback=%s",
+                    "ws=%s msgs/min=%d MB/min=%.0f reconnects=%d active=%d rest ok/fail=%d/%d fallback=%s "
+                    "cpu=%.0f%% loop_lag_max=%.0fms",
                     "up" if self.ws.connected else "DOWN",
                     self.ws.n_msgs - last_msgs,
+                    (self.ws.n_bytes - last_bytes) / 1e6,
+                    self.ws.n_connects - last_conn,
                     len(self.active),
                     self.poller.n_ok,
                     self.poller.n_fail,
                     self.poller.fallback,
+                    (time.process_time() - last_cpu) / dt * 100,
+                    self.lag_max * 1000,
                 )
-                last_log, last_msgs = time.monotonic(), self.ws.n_msgs
+                last_log, last_msgs, last_bytes = time.monotonic(), self.ws.n_msgs, self.ws.n_bytes
+                last_cpu, last_conn, self.lag_max = time.process_time(), self.ws.n_connects, 0.0
 
     def status(self) -> dict:
         now = time.time_ns()
@@ -207,6 +235,8 @@ class Recorder:
             "started": self.started,
             "pid": os.getpid(),
             "ws_connected": self.ws.connected,
+            "ws_connections": [{"shard": c.shard, "connected": c.connected, "tokens": len(c.desired),
+                                "connects": c.n_connects, "msgs": c.n_msgs} for c in self.ws.conns],
             "ws_connects": self.ws.n_connects,
             "ws_msgs": self.ws.n_msgs,
             "ws_data_age_s": round((now - self.ws.last_data_ns) / 1e9, 1) if self.ws.last_data_ns else None,
@@ -232,7 +262,7 @@ class Recorder:
         compress_leftovers(self.root)
         ws_log, rest_log, self.meta = RawLog(self.root, "ws"), RawLog(self.root, "rest"), RawLog(self.root, "meta")
         self.logs = [ws_log, rest_log, self.meta]
-        self.ws = MarketWS(cfg.ws_url, ws_log, stale_seconds=cfg.ws_stale_seconds)
+        self.ws = MarketFeed(cfg.ws_url, ws_log, cfg.ws_connections, stale_seconds=cfg.ws_stale_seconds)
         self.aux = []
         for feed in cfg.aux_feeds:
             lg = RawLog(self.root, f"aux_{feed.name}")
@@ -255,7 +285,7 @@ class Recorder:
         async with httpx.AsyncClient(timeout=10, limits=limits, headers={"User-Agent": "polyrec"}) as client:
             self.gamma = Gamma(client, cfg.gamma_url)
             self.poller = BookPoller(
-                client, cfg, rest_log, self.tokens, lambda: self.ws.healthy(cfg.rest_fallback_after)
+                client, cfg, rest_log, self.tokens, lambda: self.ws.unhealthy_tokens(cfg.rest_fallback_after)
             )
             self.ws.ctl("start")
             await self.resolve_series()
@@ -267,6 +297,7 @@ class Recorder:
                 asyncio.create_task(self.ws.run(), name="ws"),
                 asyncio.create_task(self.poller.run(), name="rest"),
                 asyncio.create_task(self.housekeeping_loop(), name="housekeeping"),
+                asyncio.create_task(self.lag_loop(), name="lag"),
             ]
             extra = [asyncio.create_task(a.run(), name=f"aux_{a.name}") for a in self.aux]
             stopper = asyncio.create_task(stop.wait())

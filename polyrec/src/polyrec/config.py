@@ -57,6 +57,7 @@ class Config:
     rest_fallback_interval: float = 1.0
     rest_fallback_after: float = 5.0  # seconds without websocket data before falling back
     ws_stale_seconds: float = 30.0  # reconnect after this long without data
+    ws_connections: int = 4  # market websocket connections the markets are spread across
     depth_levels: int = 10  # order-book levels per side kept in the 1 Hz table
     raw_retention_days: int = 3  # raw logs older than this are pruned once derived
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"

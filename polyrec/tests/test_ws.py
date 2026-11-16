@@ -154,3 +154,50 @@ def test_aux_feed_backoff_keeps_growing(tmp_path, monkeypatch):
         pass
     assert sleeps[:10] == [1, 2, 4, 8, 16, 32, 64, 128, 256, 300] and sleeps[-1] == 300
     assert feed.last_error and not feed.connected
+
+
+def test_feed_spreads_tokens_over_connections_and_tags_records(tmp_path):
+    from polyrec.ws import MarketFeed
+
+    async def go():
+        srv = FakeMarketServer()
+        async with serve(srv.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            lg = RawLog(tmp_path, "ws")
+            feed = MarketFeed(f"ws://127.0.0.1:{port}", lg, 3)
+            feed.ctl("start")
+            feed.set_tokens({0: {"A", "B"}, 2: {"C"}})  # nothing for connection 1: it must stay closed
+            task = asyncio.create_task(feed.run())
+            await wait_for(lambda: feed.n_msgs >= 2 and feed.connected)
+            assert feed.unhealthy_tokens(5) == set() and feed.n_connects == 2 and feed.n_bytes > 0
+            feed.conns[2].last_data_ns = 0  # pretend connection 2 went quiet
+            assert feed.unhealthy_tokens(5) == {"C"}
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            lg.close()
+        return srv
+
+    srv = asyncio.run(go())
+    assert srv.conns == 2
+    recs = records(tmp_path)
+    assert recs[0]["ctl"] == "start" and "s" not in recs[0]
+    subs = {r["s"]: r["ids"] for r in recs if r.get("ctl") == "subscribe"}
+    assert subs == {0: ["A", "B"], 2: ["C"]}
+    by_shard = {r["s"]: [e["asset_id"] for e in r["m"]] for r in recs if "m" in r}
+    assert by_shard == {0: ["A", "B"], 2: ["C"]}
+
+
+def test_markets_of_one_coin_land_on_different_connections(tmp_path):
+    from polyrec.config import Config
+    from polyrec.gamma import Market
+    from polyrec.recorder import Recorder
+
+    cfg = Config(data_dir=tmp_path)
+    rec = Recorder(cfg)
+    mk = lambda coin, dur: Market("c", "e", "m", "s", coin, dur, 0, 1, "u", "d")  # noqa: E731
+    for coin in ("btc", "eth"):
+        assert sorted(rec.shard_of(mk(coin, d)) for d in cfg.durations) == [0, 1, 2, 3]
+    load = [0] * cfg.ws_connections
+    for coin, dur in cfg.series:
+        load[rec.shard_of(mk(coin, dur))] += 1
+    assert load == [7, 7, 7, 7]

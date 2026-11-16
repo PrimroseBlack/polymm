@@ -21,8 +21,10 @@ class MarketWS:
     connection was up: start/connected/subscribe/unsubscribe/hb (heartbeat, every 5 s)/disconnected.
     """
 
-    def __init__(self, url: str, rawlog: RawLog, *, stale_seconds: float = 30.0, ping_interval: float = 10.0):
-        self.url, self.log = url, rawlog
+    def __init__(self, url: str, rawlog: RawLog, *, shard: int = 0, stale_seconds: float = 30.0,
+                 ping_interval: float = 10.0):  # fmt: skip
+        self.url, self.log, self.shard = url, rawlog, shard
+        self.n_bytes = 0
         self.stale_seconds, self.ping_interval = stale_seconds, ping_interval
         self.desired: set[str] = set()
         self.subscribed: set[str] = set()
@@ -43,7 +45,7 @@ class MarketWS:
         return self.connected and time.time_ns() - self.last_data_ns < max_age * 1e9
 
     def ctl(self, kind: str, **kw) -> None:
-        self.log.record(time.time_ns(), c=self.conn_id, ctl=kind, **kw)
+        self.log.record(time.time_ns(), c=self.conn_id, s=self.shard, ctl=kind, **kw)
 
     async def run(self) -> None:
         backoff = 0.5
@@ -51,6 +53,7 @@ class MarketWS:
             while not self.desired:
                 await asyncio.sleep(0.2)
             t0, why = time.monotonic(), "closed"
+            n0, b0 = self.n_msgs, self.n_bytes
             try:
                 await self._session()
             except asyncio.CancelledError:
@@ -62,9 +65,14 @@ class MarketWS:
                 if self.connected:
                     self.connected = False
                     self.ctl("disconnected", why=why)
-            if time.monotonic() - t0 > 60:  # it had been up for a while: start over
+            lived = time.monotonic() - t0
+            if lived > 60:  # it had been up for a while: start over
                 backoff = 0.5
-            log.warning("market websocket down (%s); reconnecting in ~%.1fs", why, backoff)
+            log.warning(
+                "market websocket %d down after %.0fs, %d msgs (%.0f/s, %.2f MB/s): %s; reconnecting in ~%.1fs",
+                self.shard, lived, self.n_msgs - n0, (self.n_msgs - n0) / max(lived, 1e-3),
+                (self.n_bytes - b0) / max(lived, 1e-3) / 1e6, why, backoff,
+            )  # fmt: skip
             await asyncio.sleep(backoff * (0.5 + random.random()))
             backoff = min(backoff * 2, 30)
 
@@ -80,7 +88,9 @@ class MarketWS:
             await ws.send(orjson.dumps({"assets_ids": ids, "type": "market", "custom_feature_enabled": True}).decode())
             self.subscribed = set(ids)
             self.ctl("subscribe", ids=ids)
-            log.info("market websocket connected (#%d), %d tokens", self.conn_id, len(ids))
+            compressed = bool(getattr(getattr(ws, "protocol", None), "extensions", None))
+            log.info("market websocket %d connected (#%d), %d tokens, compression %s",
+                     self.shard, self.conn_id, len(ids), "on" if compressed else "off")  # fmt: skip
             tasks = [asyncio.create_task(self._recv(ws)), asyncio.create_task(self._maintain(ws))]
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -93,7 +103,7 @@ class MarketWS:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _recv(self, ws) -> None:
-        extra = b'"c":%d,' % self.conn_id
+        extra = b'"c":%d,"s":%d,' % (self.conn_id, self.shard)
         async for msg in ws:
             ns = time.time_ns()
             self.last_rx_ns = ns
@@ -101,6 +111,7 @@ class MarketWS:
                 continue  # keepalive text (PONG and variants): proves the link, carries no data
             self.last_data_ns = ns
             self.n_msgs += 1
+            self.n_bytes += len(msg)
             self.log.write(embed(ns, extra, msg), ns)
 
     async def _maintain(self, ws) -> None:
@@ -136,6 +147,54 @@ class MarketWS:
                 await asyncio.wait_for(self._wake.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
+
+
+class MarketFeed:
+    """Several market-channel connections sharing one log, each market pinned to one of them.
+
+    One connection cannot carry every market: Polymarket drops a client whose backlog grows
+    ("slow consumer"), so the load is spread and a drop only interrupts that share.
+    """
+
+    def __init__(self, url: str, rawlog: RawLog, connections: int, *, stale_seconds: float = 30.0):
+        self.log = rawlog
+        self.conns = [MarketWS(url, rawlog, shard=i, stale_seconds=stale_seconds) for i in range(connections)]
+
+    def set_tokens(self, by_shard: dict[int, set[str]]) -> None:
+        for c in self.conns:
+            c.set_tokens(by_shard.get(c.shard, set()))
+
+    def unhealthy_tokens(self, max_age: float) -> set[str]:
+        """Tokens whose connection is not currently delivering."""
+        return {t for c in self.conns if c.desired and not c.healthy(max_age) for t in c.desired}
+
+    @property
+    def connected(self) -> bool:
+        active = [c for c in self.conns if c.desired]
+        return bool(active) and all(c.connected for c in active)
+
+    @property
+    def n_msgs(self) -> int:
+        return sum(c.n_msgs for c in self.conns)
+
+    @property
+    def n_bytes(self) -> int:
+        return sum(c.n_bytes for c in self.conns)
+
+    @property
+    def n_connects(self) -> int:
+        return sum(c.n_connects for c in self.conns)
+
+    @property
+    def last_data_ns(self) -> int:
+        """Oldest 'last data' time among the connections in use (0 if any has none yet)."""
+        return min((c.last_data_ns for c in self.conns if c.desired), default=0)
+
+    def ctl(self, kind: str) -> None:
+        self.log.record(time.time_ns(), c=0, ctl=kind)  # process-wide: no shard
+
+    async def run(self) -> None:
+        await asyncio.gather(*(c.run() for c in self.conns))
 
 
 class AuxWS:

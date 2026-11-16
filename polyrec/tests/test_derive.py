@@ -266,3 +266,34 @@ def test_prune_only_removes_days_nothing_still_needs(tmp_path):
     assert left == sorted(day(n) for n in (0, 1, 2, 3, 4, 6, 7, 8))
     assert not (tmp_path / "raw" / "aux_x" / day(5)).exists() and (tmp_path / "raw" / "rest" / day(6)).exists()
     assert prune(cfg) == []
+
+
+def test_a_dropped_connection_only_interrupts_its_own_markets(tmp_path):
+    """Two markets on two websocket connections; one connection drops for ten seconds."""
+    root = tmp_path
+    ws, meta = RawLog(root, "ws"), RawLog(root, "meta")
+    meta.record(ns(-200), k="discovered", cid="0xb", coin="btc", dur="5m", slug="b", ev=event(T0, cid="0xb", up="b1", down="b2"))
+    meta.record(ns(-200), k="discovered", cid="0xe", coin="eth", dur="5m", slug="e", ev=event(T0, cid="0xe", up="e1", down="e2"))
+    w = [(ns(-60), {"c": 0, "ctl": "start"})]
+    for shard, tok in ((0, "b1"), (1, "e1")):
+        w.append((ns(-50), {"c": 1, "s": shard, "ctl": "connected"}))
+        w.append((ns(-49.5), {"c": 1, "s": shard, "m": [book(tok, lv((0.40, 1)), lv((0.60, 1)), 1)]}))
+    for sec in range(-50, 120, 5):
+        w.append((ns(sec + 0.01), {"c": 1, "s": 0, "ctl": "hb"}))
+        if not 50 <= sec < 60:
+            w.append((ns(sec + 0.02), {"c": 2 if sec >= 60 else 1, "s": 1, "ctl": "hb"}))
+    w.append((ns(50), {"c": 1, "s": 1, "ctl": "disconnected", "why": "slow consumer"}))
+    w.append((ns(60), {"c": 2, "s": 1, "ctl": "connected"}))
+    w.append((ns(60.5), {"c": 2, "s": 1, "m": [book("e1", lv((0.45, 1)), lv((0.55, 1)), 2)]}))
+    for r, rec in sorted(w, key=lambda x: x[0]):
+        ws.record(r, **rec)
+    ws.close()
+    meta.close()
+    report = derive_day(Config(data_dir=root), DAY, fetch_missing=False)
+    ticks = pq.read_table(root / "derived" / "ticks" / f"date={DAY}" / "ticks.parquet").to_pylist()
+    secs = lambda cid: [t["sec"] for t in ticks if t["condition_id"] == cid and 40 <= t["sec"] < 70]  # noqa: E731
+    assert secs("0xb") == list(range(40, 70))  # untouched by the other connection's drop
+    assert secs("0xe") == [*range(40, 51), *range(61, 70)]  # gap from the drop to the new snapshot
+    bu = {t["sec"]: t["bu"] for t in ticks if t["condition_id"] == "0xe"}
+    assert bu[50] == 0.40 and bu[61] == 0.45
+    assert report["disconnects"] == 1

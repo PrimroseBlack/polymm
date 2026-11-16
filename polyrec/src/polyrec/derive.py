@@ -134,6 +134,7 @@ class MState:
         self.n_ticks = self.n_ticks_window = self.rest_ticks = 0
         self.n_trades = self.n_l2 = self.rest_checks = self.rest_mismatches = 0
         self.ws_outcome: str | None = None
+        self.shard: int | None = None  # websocket connection this market's books arrive on
 
 
 def load_meta(root: Path, start_ts: int, end_ts: int) -> dict[str, MState]:
@@ -198,14 +199,20 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
 
     live: list[MState] = []
     nxt = 0  # index into states of the next market to activate
-    ws_connected = False
-    last_ws_ns = 0
+    conn_up: dict[int, bool] = {}  # per websocket connection (shard): believed connected
+    last_ws: dict[int, int] = {}  # per shard: receive time of its latest record
+
+    def live_at(shard: int | None, ns: int) -> bool:
+        return shard is not None and conn_up.get(shard, False) and ns - last_ws.get(shard, 0) < WS_LIVE_NS
+
     stats = {"ws_records": 0, "rest_records": 0, "deltas_skipped": 0, "disconnects": 0}
     cl_last: dict[str, tuple[int, float]] = {}  # coin -> (receive ns, Chainlink price)
     twap_last: dict[str, tuple[int, float]] = {}
 
-    def desync(ns: int) -> None:
+    def desync(ns: int, shard: int | None = None) -> None:
         for ms in live:
+            if shard is not None and ms.shard != shard:
+                continue
             for b, name in ((ms.up, "Up"), (ms.down, "Down")):
                 if b.synced:
                     b.synced = b.known = False
@@ -249,21 +256,22 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
 
     def advance(t: int) -> None:
         """Emit the tick for second t: the state as of instant t, before anything received later."""
-        nonlocal nxt, ws_connected
+        nonlocal nxt
         while nxt < len(states) and states[nxt].m.start_ts - lead <= t:
             live.append(states[nxt])
             nxt += 1
-        ws_live = ws_connected and t * NS - last_ws_ns < WS_LIVE_NS
-        if ws_connected and not ws_live:  # the log went silent without a disconnect record
-            ws_connected = False
-            stats["disconnects"] += 1
-            desync(t * NS)
+        tns = t * NS
+        for shard, up in conn_up.items():
+            if up and tns - last_ws[shard] >= WS_LIVE_NS:  # went silent without a disconnect record
+                conn_up[shard] = False
+                stats["disconnects"] += 1
+                desync(tns, shard)
         for ms in live[:]:
             if t >= ms.m.end_ts:
                 finish(ms)
                 live.remove(ms)
             else:
-                emit(ms, t, ws_live)
+                emit(ms, t, live_at(ms.shard, tns))
 
     def snapshot(ms: MState, b: BookS, name: str, bids, asks, r: int, ts: int, rest: bool) -> None:
         cid, src = ms.m.condition_id, int(rest)
@@ -288,23 +296,28 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
         ms.n_l2 += 1 + len(b.bids) + len(b.asks)
 
     def on_ws(rec: dict) -> None:
-        nonlocal ws_connected, last_ws_ns
         r = rec["r"]
-        last_ws_ns = r
+        shard = rec.get("s", 0)
         ctl = rec.get("ctl")
+        if ctl in ("start", "stop"):  # the whole recorder: every connection is gone
+            for k in conn_up:
+                conn_up[k] = False
+            desync(r)
+            return
+        last_ws[shard] = r
         if ctl:
-            if ctl in ("start", "stop", "connected", "disconnected"):
+            if ctl in ("connected", "disconnected"):
                 if ctl == "disconnected":
                     stats["disconnects"] += 1
-                ws_connected = ctl == "connected"
-                desync(r)
+                conn_up[shard] = ctl == "connected"
+                desync(r, shard)
             elif ctl == "hb":  # the connection may have been opened before the replayed range
-                ws_connected = True
+                conn_up[shard] = True
             return
         msg = rec.get("m")
         if msg is None:
             return
-        ws_connected = True
+        conn_up[shard] = True
         for e in msg if isinstance(msg, list) else (msg,):
             et = e.get("event_type")
             if et == "price_change":
@@ -330,6 +343,7 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
                 hit = tokmap.get(e.get("asset_id"))
                 if hit:
                     ms, is_up = hit
+                    ms.shard = shard
                     b = ms.up if is_up else ms.down
                     snapshot(ms, b, "Up" if is_up else "Down", e.get("bids") or (), e.get("asks") or (), r,
                              int(e.get("timestamp") or 0), rest=False)  # fmt: skip
@@ -352,12 +366,12 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
         r, books = rec["r"], rec.get("m")
         if not isinstance(books, list):
             return
-        ws_live = ws_connected and r - last_ws_ns < WS_LIVE_NS
         for bk in books:
             hit = tokmap.get(bk.get("asset_id"))
             if hit is None:
                 continue
             ms, is_up = hit
+            ws_live = live_at(ms.shard, r)
             b = ms.up if is_up else ms.down
             bids, asks = bk.get("bids") or (), bk.get("asks") or ()
             if b.src is not None and b.synced and ws_live:
