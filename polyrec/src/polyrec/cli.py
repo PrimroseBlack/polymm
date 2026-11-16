@@ -31,7 +31,9 @@ def main(argv=None) -> int:
     s = sub.add_parser("report", help="print the coverage report for a derived day")
     s.add_argument("--date", required=True)
 
-    sub.add_parser("prune", help="delete raw logs older than raw_retention_days that are already derived")
+    sub.add_parser("prune", help="delete raw logs that are derived and past raw_retention_days")
+    s = sub.add_parser("trial", help="replay recent raw data in a scratch folder: speed, sizes, book check")
+    s.add_argument("--minutes", type=int, default=30)
 
     s = sub.add_parser("backfill", help="download historical markets and trades (no order books exist)")
     s.add_argument("--start", required=True, help="first UTC date, YYYY-MM-DD")
@@ -98,6 +100,10 @@ def main(argv=None) -> int:
         from .derive import print_report
 
         return print_report(cfg, a.date)
+    if a.cmd == "trial":
+        from .derive import trial
+
+        return trial(cfg, a.minutes)
     if a.cmd == "prune":
         from .derive import prune
 

@@ -123,7 +123,8 @@ about once a second each. They appear as `cl` and `cl_twap` in `ticks` and as ro
 | `polyrec status` | Health of the running recorder. |
 | `polyrec derive --pending` | Builds tables for every complete day not yet built (the timer runs this at 07:15 UTC). `--date YYYY-MM-DD` rebuilds one day. |
 | `polyrec report --date D` | Coverage for a derived day: missing and incomplete windows per series. |
-| `polyrec prune` | Deletes raw logs older than `raw_retention_days` that are already derived. |
+| `polyrec prune` | Deletes raw hour-files that are already derived and older than `raw_retention_days`. Never deletes a day that has not been derived. |
+| `polyrec trial` | Replays the last 30 minutes in a scratch folder and reports replay speed, projected table sizes per day, and whether the rebuilt books agree with the exchange. Changes nothing. |
 | `polyrec backfill --start D --end D` | Downloads results and trades for past markets. `--coins`, `--durations`, `--no-trades` narrow it. Resumable. |
 | `polyrec seed-kacho` | Downloads Kacho's dataset (~725 MB) into `data/seed/kacho/`. |
 | `polyrec clob-creds` | Creates the API credentials the Chainlink feed needs. |
@@ -158,7 +159,8 @@ seed/kacho/<coin>_{markets,ticks}.parquet
 | `n_ticks_window` / `expected_ticks` | Seconds of the window that have a tick / seconds in the window. |
 | `rest_ticks` | Ticks that came from REST snapshots because the websocket was down. |
 | `n_trades`, `n_l2` | Rows in the other tables. |
-| `rest_checks`, `rest_mismatches` | Routine REST cross-checks and how many disagreed on the top of book. Some disagreement is normal: the two are read ~100–300 ms apart. |
+| `resyncs`, `resync_dirty` | The exchange re-sends the full book on every trade. `resyncs` counts those snapshots; `resync_dirty` counts the ones that differed from the book rebuilt from the changes before it. This is the direct check that the replay is right: `resync_dirty` should be at or near zero. |
+| `rest_checks`, `rest_mismatches` | Routine REST cross-checks and how many disagreed on the top of book. Disagreement here is expected on busy markets: the two are read ~100–300 ms apart. |
 | `ws_outcome` | Winner announced on the websocket, if seen. |
 
 ### `ticks` — one row per market per second
@@ -185,7 +187,9 @@ side of the book was empty.
 
 ### `l2` — every book change
 
-For event-level backtests. Per token (`condition_id` + `outcome`), in receive order:
+For event-level backtests. Only the **Up** book is stored: the Down book is its mirror image
+(a Down bid at p is an Up ask at 1 − p, same size). Set `l2_both_outcomes = true` to store
+both. Per token (`condition_id` + `outcome`), in receive order:
 
 | `kind` | Meaning |
 |---|---|
@@ -194,8 +198,9 @@ For event-level backtests. Per token (`condition_id` + `outcome`), in receive or
 | 0 delta | Set that level to `size`; 0 removes it. |
 | 3 desync | The feed dropped: the book is unknown until the next reset. |
 
-`r` is the local receive time in nanoseconds, `ts_ms` the exchange timestamp, `src` 0 websocket /
-1 REST. `polyrec.replay.replay(rows)` applies these and yields the book after each row.
+A full-book snapshot the replay already holds is stored as its differences only, so a reset
+appears only after the feed was lost. `r` is the local receive time in nanoseconds, `ts_ms`
+the exchange timestamp, `src` 0 websocket / 1 REST. `polyrec.replay.replay(rows)` applies these and yields the book after each row.
 
 ### `trades`, `ref`
 
@@ -231,15 +236,17 @@ delayed (150 ms at the time of writing), which a 1 Hz table cannot model — use
 
 ## Disk
 
-The order-book feed is heavy: a smoke test on 16 Nov 2026 saw about 1,000 messages a second
-for the BTC and ETH 5-minute markets alone. Raw logs are compressed hourly and deleted
-`raw_retention_days` (default 3) after they have been turned into tables, but several days of
-raw logs plus the growing tables can still fill a small disk.
+The order-book feed is heavy. Measured on 16 Nov 2026 with all 28 series: about 3,800
+messages a second, 8 GB of raw log an hour, compressing to roughly 0.8 GB an hour (~20 GB a
+day). Budget for:
 
-Check after the first hour and again after the first day:
+- the current hour, uncompressed (~8 GB);
+- compressed raw logs from the start of the oldest day not yet derived (up to ~33 hours),
+  or `raw_retention_days` if that is longer;
+- the tables, which grow every day. `polyrec trial` projects their size from real data.
 
 ```bash
-du -sh /var/lib/polyrec/raw/* /var/lib/polyrec/derived/* ; df -h /var/lib/polyrec
+sudo -u polyrec /opt/polyrec/.venv/bin/polyrec -c /etc/polyrec.toml trial
 ```
 
 If it is tight: lower `raw_retention_days`, lower `depth_levels`, record fewer `durations`, or
@@ -254,8 +261,9 @@ attach a larger volume and point `data_dir` at it.
 | Market websocket (subscribe, heartbeat, snapshots, adding markets on the fly) | Passed `polyrec smoke` against Polymarket from a Hetzner server in Helsinki. Reconnect and stall handling are tested only against a local stand-in. |
 | Chainlink feed and `clob-creds` | Passed `polyrec smoke` against Polymarket, with credentials from a throwaway wallet. |
 | Binance spot feed | Passed `polyrec smoke`. |
-| Order books rebuilt from websocket messages equal Polymarket's REST snapshots | **Not yet confirmed.** `smoke` reports this as an advisory line; `rest_mismatches` in the markets table tracks it per market. Raw logs are verbatim, so tables can be rebuilt if the replay logic needs a fix. |
-| A full day of unattended recording, and the daily derive at real data volumes | **Not yet run.** |
+| Recording at full volume | Running on a Hetzner CPX22: ~3,800 messages a second across four connections at 12% CPU. One connection carrying everything was dropped by Polymarket every 30 seconds. |
+| Rebuilt order books equal the exchange's | **Not yet confirmed on real data.** `polyrec trial` and the `resyncs` / `resync_dirty` columns measure it. Raw logs are verbatim, so tables can be rebuilt while those are kept. |
+| A full day of unattended recording, and the daily derive at real data volumes | **Not yet run.** On synthetic data at the real rate the replay handles ~70,000 messages a second on one core. |
 | `seed-kacho` download | Not run end to end. |
 
 ## Development

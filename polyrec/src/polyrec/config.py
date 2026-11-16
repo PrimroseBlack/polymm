@@ -55,10 +55,11 @@ class Config:
     # REST order-book snapshots: a slow cross-check normally, fast while the websocket is down.
     rest_checkpoint_interval: float = 30.0
     rest_fallback_interval: float = 1.0
-    rest_fallback_after: float = 5.0  # seconds without websocket data before falling back
+    rest_fallback_after: float = 3.0  # seconds without websocket data before falling back
     ws_stale_seconds: float = 30.0  # reconnect after this long without data
     ws_connections: int = 4  # market websocket connections the markets are spread across
     depth_levels: int = 10  # order-book levels per side kept in the 1 Hz table
+    l2_both_outcomes: bool = False  # also store the Down book's changes in l2 (it mirrors Up)
     raw_retention_days: int = 3  # raw logs older than this are pruned once derived
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     gamma_url: str = "https://gamma-api.polymarket.com"

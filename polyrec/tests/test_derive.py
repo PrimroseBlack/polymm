@@ -242,7 +242,7 @@ def test_report(derived, capsys):
     assert (Path(cfg.data_dir) / "derived" / "_done" / f"{DAY}.json").exists()
 
 
-def test_prune_only_removes_days_nothing_still_needs(tmp_path):
+def test_prune_keeps_what_the_next_derive_needs(tmp_path):
     import time
 
     from polyrec.derive import prune
@@ -250,22 +250,111 @@ def test_prune_only_removes_days_nothing_still_needs(tmp_path):
 
     now = time.time()
     day = lambda n: day_of(now - n * 86400)  # noqa: E731
-    cfg = Config(data_dir=tmp_path, raw_retention_days=3)
-    for n in range(0, 9):
-        for stream in ("ws", "rest", "aux_x"):
-            (tmp_path / "raw" / stream / day(n)).mkdir(parents=True)
-    (tmp_path / "derived" / "_done").mkdir(parents=True)
-    for n in (4, 5, 6, 8):  # day 7 was never derived
-        (tmp_path / "derived" / "_done" / f"{day(n)}.json").write_text("{}")
 
-    assert prune(cfg) == [day(5)]
-    left = sorted(p.name for p in (tmp_path / "raw" / "ws").iterdir())
-    # 8: the day after it (7) is not derived.   7: not derived.   6: day 7 before it is not derived.
-    # 5: old enough, and 4, 5, 6 are all derived -> removed from every stream.
-    # 4: day 3 after it is not derived.          3..0: not derived / inside the retention window.
-    assert left == sorted(day(n) for n in (0, 1, 2, 3, 4, 6, 7, 8))
-    assert not (tmp_path / "raw" / "aux_x" / day(5)).exists() and (tmp_path / "raw" / "rest" / day(6)).exists()
+    def make(retention, done):
+        root = tmp_path / f"r{retention}-{len(done)}"
+        for n in range(0, 6):
+            for stream in ("ws", "rest"):
+                d = root / "raw" / stream / day(n)
+                d.mkdir(parents=True)
+                for hh in ("00", "22", "23"):
+                    (d / f"{stream}-{day(n).replace('-', '')}T{hh}.jsonl.zst").write_text("x")
+        (root / "derived" / "_done").mkdir(parents=True)
+        for n in done:
+            (root / "derived" / "_done" / f"{day(n)}.json").write_text("{}")
+        return Config(data_dir=root, raw_retention_days=retention), root
+
+    def left(root):
+        return sorted(f"{p.parent.name[-2:]}T{p.name[-12:-10]}" for p in (root / "raw" / "ws").glob("*/*"))
+
+    full = lambda ns: sorted(f"{day(n)[-2:]}T{hh}" for n in ns for hh in ("00", "22", "23"))  # noqa: E731
+
+    # Days 5, 4, 3 derived; day 2 is next. It reads from 23:00 of day 3, so everything before goes.
+    cfg, root = make(0, done=(5, 4, 3))
+    removed = prune(cfg)
+    assert left(root) == sorted([f"{day(3)[-2:]}T23", *full((2, 1, 0))])
+    assert len(removed) == 2 * (3 + 3 + 2) and not (root / "raw" / "rest" / day(5)).exists()
     assert prune(cfg) == []
+
+    # Nothing derived yet: nothing may be deleted, however old.
+    cfg, root = make(0, done=())
+    assert prune(cfg) == [] and left(root) == full(range(6))
+
+    # A gap: day 4 was never derived, so days 4 onwards stay even though 3 is done.
+    cfg, root = make(0, done=(5, 3))
+    prune(cfg)
+    assert left(root) == sorted([f"{day(5)[-2:]}T23", *full((4, 3, 2, 1, 0))])
+
+    # Retention keeps derived days longer: with 4 days, only files older than that go.
+    cfg, root = make(4, done=(5, 4, 3))
+    prune(cfg)
+    kept = left(root)
+    assert f"{day(3)[-2:]}T00" in kept and f"{day(5)[-2:]}T00" not in kept
+
+
+def test_exchange_snapshots_are_checked_against_the_rebuilt_book(tmp_path):
+    """The websocket re-sends the whole book on every trade; the replay must already hold it."""
+    ws, meta = RawLog(tmp_path, "ws"), RawLog(tmp_path, "meta")
+    meta.record(ns(-200), k="discovered", cid=CID, coin="btc", dur="5m", slug="s", ev=event(T0))
+    change = lambda asset, price, size, side: {"asset_id": asset, "price": price, "size": size, "side": side}  # noqa: E731
+    w = [
+        (ns(-50), {"c": 1, "s": 0, "ctl": "connected"}),
+        (ns(-49), {"c": 1, "s": 0, "m": [book(UP, lv((0.49, 100)), lv((0.51, 80)), 1), book(DOWN, lv((0.49, 80)), lv((0.51, 100)), 1)]}),
+        (ns(10), {"c": 1, "s": 0, "m": {"event_type": "price_change", "timestamp": "2", "price_changes": [
+            change(UP, "0.50", "30", "BUY"), change(DOWN, "0.50", "30", "SELL")]}}),
+        # Same book the deltas produced: agrees, and adds nothing to l2.
+        (ns(20), {"c": 1, "s": 0, "m": [book(UP, lv((0.49, 100), (0.50, 30)), lv((0.51, 80)), 3)]}),
+        # A book the deltas did not produce (0.50 is 31, 0.49 is gone): counted, and l2 is corrected.
+        (ns(30), {"c": 1, "s": 0, "m": [book(UP, lv((0.50, 31)), lv((0.51, 80)), 4)]}),
+    ]
+    w += [(ns(sec + 0.5), {"c": 1, "s": 0, "ctl": "hb"}) for sec in range(-50, 60, 5)]
+    for r, rec in sorted(w, key=lambda x: x[0]):
+        ws.record(r, **rec)
+    ws.close()
+    meta.close()
+    report = derive_day(Config(data_dir=tmp_path), DAY, fetch_missing=False)
+    read = lambda name: pq.read_table(tmp_path / "derived" / name / f"date={DAY}" / f"{name}.parquet").to_pylist()  # noqa: E731
+    (m,) = read("markets")
+    assert (m["resyncs"], m["resync_dirty"]) == (2, 1) and (report["resyncs"], report["resync_dirty"]) == (2, 1)
+    l2 = read("l2")
+    assert {r["outcome"] for r in l2} == {"Up"}  # the mirrored Down book is not stored
+    assert [(r["kind"], r["side"], r["price"], r["size"]) for r in l2] == [
+        (RESET, -1, None, None), (LEVEL, 0, 0.49, 100.0), (LEVEL, 1, 0.51, 80.0),
+        (DELTA, 0, 0.5, 30.0),
+        (DELTA, 0, 0.49, 0.0), (DELTA, 0, 0.5, 31.0),
+    ]  # fmt: skip
+    ticks = {t["sec"]: t for t in read("ticks")}
+    assert ticks[25]["bu"] == 0.5 and ticks[25]["su"] == 30.0 and ticks[25]["ad"] == 0.5  # Down still tracked
+    assert ticks[31]["bid_px"] == [0.5] and ticks[31]["su"] == 31.0
+
+    # With both outcomes stored, the Down book appears too.
+    out2 = tmp_path / "both"
+    derive_day(Config(data_dir=tmp_path, l2_both_outcomes=True), DAY, fetch_missing=False, out=out2, mark_done=False)
+    both = pq.read_table(out2 / "l2" / f"date={DAY}" / "l2.parquet").to_pylist()
+    assert {r["outcome"] for r in both} == {"Up", "Down"} and not (out2 / "_done").exists()
+
+
+def test_trial_measures_without_touching_real_tables(tmp_path, capsys, monkeypatch):
+    import time as _time
+
+    from polyrec import derive as dv
+
+    now = int(_time.time())
+    start = (now - 900) // 300 * 300  # a 5m market that began 10-15 minutes ago
+    ws, meta = RawLog(tmp_path, "ws"), RawLog(tmp_path, "meta")
+    meta.record((start - 100) * NS, k="discovered", cid=CID, coin="btc", dur="5m", slug="s", ev=event(start))
+    ws.record((start - 60) * NS, c=1, s=0, ctl="connected")
+    ws.record((start - 59) * NS, c=1, s=0, m=[book(UP, lv((0.49, 100)), lv((0.51, 80)), 1)])
+    for sec in range(-55, 300, 5):
+        ws.record((start + sec) * NS, c=1, s=0, ctl="hb")
+        ws.record((start + sec) * NS + 1, c=1, s=0, m=[book(UP, lv((0.49, 100)), lv((0.51, 80)), 2)])
+    ws.close()
+    meta.close()
+    assert dv.trial(Config(data_dir=tmp_path), minutes=20) == 0
+    out = capsys.readouterr().out
+    assert "1 markets" in out and "book check" in out and "of 71 agree (100.00%)" in out
+    assert "projected per day" in out and "replay speed" in out
+    assert not (tmp_path / "derived").exists() and not (tmp_path / "trial_tmp").exists()
 
 
 def test_a_dropped_connection_only_interrupts_its_own_markets(tmp_path):

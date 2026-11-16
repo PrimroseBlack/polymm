@@ -9,6 +9,7 @@ Tables written under <data_dir>/derived/:
 """
 from __future__ import annotations
 
+import calendar
 import heapq
 import json
 import logging
@@ -61,7 +62,7 @@ MARKETS = pa.schema(
      ("tick_size", F8), ("fee_rate", F8), ("resolution_source", pa.string()),
      ("n_ticks", I8), ("n_ticks_window", I8), ("expected_ticks", I8), ("rest_ticks", I8),
      ("n_trades", I8), ("n_l2", I8), ("rest_checks", I8), ("rest_mismatches", I8),
-     ("ws_outcome", pa.string())]
+     ("resyncs", I8), ("resync_dirty", I8), ("ws_outcome", pa.string())]
 )  # fmt: skip
 REF = pa.schema(
     [("r", I8), ("ts_ms", I8), ("feed", pa.string()), ("symbol", pa.string()), ("price", F8), ("snapshot", pa.int8())]
@@ -75,11 +76,15 @@ DELTA, LEVEL, RESET, DESYNC = 0, 1, 2, 3
 class Sink:
     """Buffered Parquet writer; the file appears under its final name only when closed."""
 
-    def __init__(self, path: Path, schema: pa.Schema, batch: int = 200_000):
+    def __init__(self, path: Path, schema: pa.Schema, batch: int = 200_000, delta: tuple = ()):
         self.path, self.schema, self.batch = path, schema, batch
         self.tmp = path.with_name(path.name + ".tmp")
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.writer = pq.ParquetWriter(self.tmp, schema, compression="zstd")
+        opts = {}
+        if delta:  # near-monotonic integer columns pack far better delta-encoded than as a dictionary
+            opts = {"use_dictionary": [n for n in schema.names if n not in delta],
+                    "column_encoding": {n: "DELTA_BINARY_PACKED" for n in delta}}  # fmt: skip
+        self.writer = pq.ParquetWriter(self.tmp, schema, compression="zstd", **opts)
         self.cols: list[list] = [[] for _ in schema]
         self.rows = 0
 
@@ -133,6 +138,7 @@ class MState:
         self.rows: list[list] = [[] for _ in range(len(TICKS) - 3)]
         self.n_ticks = self.n_ticks_window = self.rest_ticks = 0
         self.n_trades = self.n_l2 = self.rest_checks = self.rest_mismatches = 0
+        self.resyncs = self.resync_dirty = 0  # websocket snapshots of an in-sync book / that disagreed with it
         self.ws_outcome: str | None = None
         self.shard: int | None = None  # websocket connection this market's books arrive on
 
@@ -174,22 +180,32 @@ def _f(x) -> float | None:
         return None
 
 
-def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
-    """Build every table for markets that started on `day` (UTC). Safe to re-run."""
+def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True, window: tuple[int, int] | None = None,
+               out: Path | None = None, mark_done: bool = True) -> dict:  # fmt: skip
+    """Build every table for markets that started on `day` (UTC). Safe to re-run.
+
+    With `window=(t0, t1)` it instead replays just that time span for every market active in
+    it (used by `polyrec trial` to measure speed and sizes without touching the real tables).
+    """
     t_run = time.monotonic()
     root = Path(cfg.data_dir)
-    out = root / "derived"
+    out = out or root / "derived"
     d0 = day_start(day)
     d1 = d0 + 86400
     lead, nlev = cfg.lead_seconds, cfg.depth_levels
-    states = [ms for ms in load_meta(root, d0 - 86400, d1 + 8 * 3600).values() if d0 <= ms.m.start_ts < d1]
+    if window:
+        states = [ms for ms in load_meta(root, window[0] - 86400, window[1]).values()
+                  if ms.m.start_ts - lead < window[1] and ms.m.end_ts > window[0]]  # fmt: skip
+    else:
+        states = [ms for ms in load_meta(root, d0 - 86400, d1 + 8 * 3600).values() if d0 <= ms.m.start_ts < d1]
     states.sort(key=lambda ms: (ms.m.start_ts, ms.m.coin, ms.m.duration))
     log.info("%s: %d markets in the metadata log", day, len(states))
 
     part = f"date={day}"
     ticks = Sink(out / "ticks" / part / "ticks.parquet", TICKS, batch=50_000)
-    l2 = Sink(out / "l2" / part / "l2.parquet", L2)
+    l2 = Sink(out / "l2" / part / "l2.parquet", L2, delta=("r", "ts_ms"))
     trades = Sink(out / "trades" / part / "trades.parquet", TRADES)
+    both = cfg.l2_both_outcomes  # the Down book mirrors the Up book, so by default only Up is stored
 
     tokmap: dict[str, tuple[MState, bool]] = {}
     for ms in states:
@@ -216,7 +232,8 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
             for b, name in ((ms.up, "Up"), (ms.down, "Down")):
                 if b.synced:
                     b.synced = b.known = False
-                    l2.add(ns, 0, ms.m.condition_id, name, DESYNC, -1, None, None, 0)
+                    if both or name == "Up":
+                        l2.add(ns, 0, ms.m.condition_id, name, DESYNC, -1, None, None, 0)
 
     def finish(ms: MState) -> None:
         n = len(ms.rows[0])
@@ -275,25 +292,37 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
 
     def snapshot(ms: MState, b: BookS, name: str, bids, asks, r: int, ts: int, rest: bool) -> None:
         cid, src = ms.m.condition_id, int(rest)
-        old = (b.bids, b.asks) if rest and b.known and b.src == "rest" else None
+        store = both or name == "Up"
+        # A snapshot of a book we already hold from the same source is stored as its differences.
+        # For the websocket (which re-sends the full book on every trade) there should be none:
+        # any difference means the replayed deltas had drifted from the exchange's book.
+        same_source = b.known and b.src == ("rest" if rest else "ws") and (rest or b.synced)
+        old = (b.bids, b.asks) if same_source else None
         b.snapshot(bids, asks, "rest" if rest else "ws", r)
         if old is not None:
-            # Consecutive REST snapshots (one per second in fallback): store only what changed.
+            changed = 0
             for side, (was, now) in enumerate(zip(old, (b.bids, b.asks))):
                 for p in was.keys() - now.keys():
-                    l2.add(r, ts, cid, name, DELTA, side, p / 10_000, 0.0, src)
-                    ms.n_l2 += 1
+                    changed += 1
+                    if store:
+                        l2.add(r, ts, cid, name, DELTA, side, p / 10_000, 0.0, src)
                 for p, s in now.items():
                     if was.get(p) != s:
-                        l2.add(r, ts, cid, name, DELTA, side, p / 10_000, s, src)
-                        ms.n_l2 += 1
+                        changed += 1
+                        if store:
+                            l2.add(r, ts, cid, name, DELTA, side, p / 10_000, s, src)
+            if not rest:
+                ms.resyncs += 1
+                ms.resync_dirty += changed > 0
+            ms.n_l2 += changed if store else 0
             return
         b.known = True
-        l2.add(r, ts, cid, name, RESET, -1, None, None, src)
-        for side, levels in ((0, b.bids), (1, b.asks)):
-            for p, s in levels.items():
-                l2.add(r, ts, cid, name, LEVEL, side, p / 10_000, s, src)
-        ms.n_l2 += 1 + len(b.bids) + len(b.asks)
+        if store:
+            l2.add(r, ts, cid, name, RESET, -1, None, None, src)
+            for side, levels in ((0, b.bids), (1, b.asks)):
+                for p, s in levels.items():
+                    l2.add(r, ts, cid, name, LEVEL, side, p / 10_000, s, src)
+            ms.n_l2 += 1 + len(b.bids) + len(b.asks)
 
     def on_ws(rec: dict) -> None:
         r = rec["r"]
@@ -337,8 +366,9 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
                     is_bid = c["side"] == "BUY"
                     price, size = float(c["price"]), float(c["size"])
                     b.apply(is_bid, price, size, r)
-                    l2.add(r, ts, ms.m.condition_id, "Up" if is_up else "Down", DELTA, 0 if is_bid else 1, price, size, 0)
-                    ms.n_l2 += 1
+                    if is_up or both:
+                        l2.add(r, ts, ms.m.condition_id, "Up" if is_up else "Down", DELTA, 0 if is_bid else 1, price, size, 0)
+                        ms.n_l2 += 1
             elif et == "book":
                 hit = tokmap.get(e.get("asset_id"))
                 if hit:
@@ -397,6 +427,8 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
     if states:
         t_begin = states[0].m.start_ts - lead
         t_end = max(ms.m.end_ts for ms in states) + cfg.linger_seconds + 5
+        if window:
+            t_begin, t_end = window
         merged = heapq.merge(
             ((rec["r"], 0, rec) for rec in iter_raw(root, "ws", t_begin * NS, t_end * NS)),
             ((rec["r"], 1, rec) for rec in iter_raw(root, "rest", t_begin * NS, t_end * NS)),
@@ -447,7 +479,8 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
                  resolution_source=d0m.get("resolutionSource"),
                  n_ticks=ms.n_ticks, n_ticks_window=ms.n_ticks_window, expected_ticks=m.end_ts - m.start_ts,
                  rest_ticks=ms.rest_ticks, n_trades=ms.n_trades, n_l2=ms.n_l2,
-                 rest_checks=ms.rest_checks, rest_mismatches=ms.rest_mismatches, ws_outcome=ms.ws_outcome)
+                 rest_checks=ms.rest_checks, rest_mismatches=ms.rest_mismatches,
+                 resyncs=ms.resyncs, resync_dirty=ms.resync_dirty, ws_outcome=ms.ws_outcome)
         )  # fmt: skip
     if client:
         client.close()
@@ -466,14 +499,18 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True) -> dict:
     for row in rows:
         mk.add(*(row[name] for name in MARKETS.names))
     mk.close()
-    n_ref = derive_ref(cfg, day)
+    n_ref = 0 if window else derive_ref(cfg, day)
 
     report = build_report(day, rows)
     report.update(stats, ticks=ticks.rows, l2=l2.rows, trades=trades.rows, ref=n_ref,
+                  resyncs=sum(r["resyncs"] for r in rows), resync_dirty=sum(r["resync_dirty"] for r in rows),
+                  rest_checks=sum(r["rest_checks"] for r in rows),
+                  rest_mismatches=sum(r["rest_mismatches"] for r in rows),
                   seconds=round(time.monotonic() - t_run, 1), derived_at=time.time())  # fmt: skip
-    done = out / "_done" / f"{day}.json"
-    done.parent.mkdir(parents=True, exist_ok=True)
-    done.write_text(json.dumps(report, indent=1))
+    if mark_done:
+        done = out / "_done" / f"{day}.json"
+        done.parent.mkdir(parents=True, exist_ok=True)
+        done.write_text(json.dumps(report, indent=1))
     log.info("%s: %d markets, %d ticks, %d l2 rows, %d trades in %.0fs",
              day, len(rows), ticks.rows, l2.rows, trades.rows, report["seconds"])  # fmt: skip
     return report
@@ -568,23 +605,71 @@ def pending_days(cfg: Config) -> list[str]:
 
 
 def prune(cfg: Config) -> list[str]:
-    """Delete raw logs of days older than the retention window once no derive run needs them.
+    """Delete raw hour-files that no future derive run needs and that are past the retention window.
 
-    A day's raw files feed three runs: the day before (4h windows spill over midnight), the day
-    itself, and the day after (its first markets are recorded from a few minutes before midnight).
+    The next run to happen is for the earliest day not yet derived; it reads from shortly before
+    that day's first market (the lead time), so everything older than an hour before that day is
+    unneeded. `raw_retention_days` keeps files longer than that, as a safety margin for re-deriving.
+    Nothing is deleted for a day until it has been derived, so a failing derive never loses data.
     """
     root = Path(cfg.data_dir)
-    done = lambda d: (root / "derived" / "_done" / f"{d}.json").exists()  # noqa: E731
-    has_raw = lambda d: (root / "raw" / "ws" / d).exists()  # noqa: E731
-    cutoff = time.time() - cfg.raw_retention_days * 86400
-    days = sorted({p.name for p in (root / "raw").glob("*/????-??-??")})
-    pruned = []
-    for d in days:
-        t = day_start(d)
-        prev, nxt = day_of(t - 86400), day_of(t + 86400)
-        if t + 86400 < cutoff and done(d) and done(nxt) and (done(prev) or not has_raw(prev)):
-            for p in (root / "raw").glob(f"*/{d}"):
-                shutil.rmtree(p)
-            pruned.append(d)
-            log.info("pruned raw logs for %s", d)
-    return pruned
+    raw = root / "raw"
+    days = sorted({p.name for p in raw.glob("*/????-??-??")})
+    undone = [d for d in days if not (root / "derived" / "_done" / f"{d}.json").exists()]
+    first_needed = day_start(undone[0]) if undone else time.time()
+    margin = 3600 * (1 + cfg.lead_seconds // 3600)
+    keep_from = min(first_needed - margin, time.time() - cfg.raw_retention_days * 86400)
+    removed = []
+    for f in sorted(raw.glob("*/????-??-??/*.jsonl*")):
+        stamp = f.name.split(".")[0].rsplit("-", 1)[-1]  # YYYYMMDDTHH
+        try:
+            hour_start = calendar.timegm(time.strptime(stamp, "%Y%m%dT%H"))
+        except ValueError:
+            continue
+        if hour_start + 3600 <= keep_from:
+            f.unlink()
+            removed.append(str(f.relative_to(raw)))
+    for d in raw.glob("*/????-??-??"):
+        if not any(d.iterdir()):
+            d.rmdir()
+    if removed:
+        log.info("pruned %d raw files up to %s", len(removed), removed[-1])
+    return removed
+
+
+def trial(cfg: Config, minutes: int = 30) -> int:
+    """Replay the last `minutes` of raw data into a scratch folder and report speed, sizes and
+    whether the rebuilt books agree with the exchange. Leaves the real tables untouched."""
+    root = Path(cfg.data_dir)
+    w1 = int(time.time()) - 60
+    w0 = w1 - minutes * 60
+    out = root / "trial_tmp"
+    shutil.rmtree(out, ignore_errors=True)
+    try:
+        rep = derive_day(cfg, day_of(w0), fetch_missing=False, window=(w0, w1), out=out, mark_done=False)
+        size = {p.parent.parent.name: p.stat().st_size for p in out.glob("*/*/*.parquet")}
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+    per_day = 86400 / (w1 - w0)
+    n = rep["ws_records"]
+    print(f"window: last {minutes} min, {rep['markets']} markets, {n:,} websocket records ({n / (w1 - w0):,.0f}/s)")
+    if not n:
+        print("no websocket data in the window: is the recorder running?")
+        return 1
+    secs = max(rep["seconds"], 0.01)
+    print(f"replay speed: {n / secs:,.0f} records/s -> a full day at this rate takes about {secs * per_day / 3600:.1f} h")
+    print("tables, projected per day: " + ", ".join(
+        f"{name} {size.get(name, 0) * per_day / 1e9:.2f} GB" for name in ("l2", "ticks", "trades", "markets")))  # fmt: skip
+    print(f"rows in window: ticks {rep['ticks']:,}, l2 {rep['l2']:,}, trades {rep['trades']:,}; "
+          f"deltas skipped {rep['deltas_skipped']:,}; disconnects {rep['disconnects']}")  # fmt: skip
+    hours = sorted(root.glob("raw/ws/*/*.jsonl.zst"))[-3:]
+    if hours:
+        avg = sum(f.stat().st_size for f in hours) / len(hours)
+        print(f"raw websocket log: {avg / 1e9:.2f} GB per compressed hour (last {len(hours)}) -> about {avg * 24 / 1e9:.0f} GB/day")
+    rs, dirty = rep["resyncs"], rep["resync_dirty"]
+    print(f"book check (exchange snapshots vs rebuilt book): {rs - dirty:,} of {rs:,} agree"
+          + (f" ({100 * (rs - dirty) / rs:.2f}%)" if rs else ""))  # fmt: skip
+    print(f"REST cross-check (timing-sensitive): {rep['rest_checks'] - rep['rest_mismatches']:,} of {rep['rest_checks']:,} agree")
+    du = shutil.disk_usage(root)
+    print(f"disk: {du.free / 1e9:.0f} GB free of {du.total / 1e9:.0f} GB")
+    return 0
