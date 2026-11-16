@@ -639,6 +639,13 @@ def prune(cfg: Config) -> list[str]:
             d.rmdir()
     if removed:
         log.info("pruned %d raw files up to %s", len(removed), removed[-1])
+    if cfg.l2_retention_days > 0:  # rolling window for the one large table; the others are kept
+        oldest_kept = day_of(time.time() - cfg.l2_retention_days * 86400)
+        for d in sorted((root / "derived" / "l2").glob("date=????-??-??")):
+            if d.name[5:] < oldest_kept:
+                shutil.rmtree(d)
+                removed.append(f"l2/{d.name}")
+                log.info("dropped order-book-change table for %s (older than %d days)", d.name[5:], cfg.l2_retention_days)
     return removed
 
 

@@ -60,6 +60,7 @@ class Config:
     ws_connections: int = 4  # market websocket connections the markets are spread across
     depth_levels: int = 10  # order-book levels per side kept in the 1 Hz table
     l2_both_outcomes: bool = False  # also store the Down book's changes in l2 (it mirrors Up)
+    l2_retention_days: int = 0  # keep the l2 table only this many days back; 0 keeps it forever
     raw_retention_days: int = 3  # raw logs older than this are pruned once derived
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     gamma_url: str = "https://gamma-api.polymarket.com"

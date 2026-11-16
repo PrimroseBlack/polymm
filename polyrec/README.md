@@ -123,7 +123,7 @@ about once a second each. They appear as `cl` and `cl_twap` in `ticks` and as ro
 | `polyrec status` | Health of the running recorder. |
 | `polyrec derive --pending` | Builds tables for every complete day not yet built (the timer runs this at 07:15 UTC). `--date YYYY-MM-DD` rebuilds one day. |
 | `polyrec report --date D` | Coverage for a derived day: missing and incomplete windows per series. |
-| `polyrec prune` | Deletes raw hour-files that are already derived and older than `raw_retention_days`. Never deletes a day that has not been derived. |
+| `polyrec prune` | Deletes raw hour-files that are already derived and older than `raw_retention_days`, never a day that has not been derived. Also drops `l2` partitions older than `l2_retention_days`, if set. |
 | `polyrec trial` | Replays the last 30 minutes in a scratch folder and reports replay speed, projected table sizes per day, and whether the rebuilt books agree with the exchange. Changes nothing. |
 | `polyrec backfill --start D --end D` | Downloads results and trades for past markets. `--coins`, `--durations`, `--no-trades` narrow it. Resumable. |
 | `polyrec seed-kacho` | Downloads Kacho's dataset (~725 MB) into `data/seed/kacho/`. |
@@ -249,8 +249,12 @@ day). Budget for:
 sudo -u polyrec /opt/polyrec/.venv/bin/polyrec -c /etc/polyrec.toml trial
 ```
 
-If it is tight: lower `raw_retention_days`, lower `depth_levels`, record fewer `durations`, or
-attach a larger volume and point `data_dir` at it.
+The order-book-change table (`l2`) is nearly all of the table growth, about 2 GB a day.
+`l2_retention_days = 10` keeps a rolling ten days of it and everything else forever; the
+other tables together grow about 6 GB a month.
+
+If it is still tight: lower `raw_retention_days`, lower `depth_levels`, record fewer
+`durations`, or attach a larger volume and point `data_dir` at it.
 
 ## What has and has not been verified
 

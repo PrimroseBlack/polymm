@@ -387,3 +387,27 @@ def test_a_dropped_connection_only_interrupts_its_own_markets(tmp_path):
     bu = {t["sec"]: t["bu"] for t in ticks if t["condition_id"] == "0xe"}
     assert bu[50] == 0.40 and bu[61] == 0.45
     assert report["disconnects"] == 1
+
+
+def test_l2_rolling_window_drops_only_old_l2(tmp_path):
+    import time
+
+    from polyrec.derive import prune
+    from polyrec.util import day_of
+
+    day = lambda n: day_of(time.time() - n * 86400)  # noqa: E731
+    for table in ("l2", "ticks", "trades", "markets"):
+        for n in range(0, 6):
+            d = tmp_path / "derived" / table / f"date={day(n)}"
+            d.mkdir(parents=True)
+            (d / f"{table}.parquet").write_text("x")
+    kept = lambda table: sorted(p.name[5:] for p in (tmp_path / "derived" / table).iterdir())  # noqa: E731
+
+    assert prune(Config(data_dir=tmp_path)) == []  # the default keeps everything
+    assert len(kept("l2")) == 6
+
+    removed = prune(Config(data_dir=tmp_path, l2_retention_days=3))
+    assert removed == [f"l2/date={day(5)}", f"l2/date={day(4)}"]
+    assert kept("l2") == sorted(day(n) for n in (3, 2, 1, 0))
+    for table in ("ticks", "trades", "markets"):
+        assert len(kept(table)) == 6  # the small tables are never touched
