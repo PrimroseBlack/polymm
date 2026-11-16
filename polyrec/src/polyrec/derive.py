@@ -221,7 +221,8 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True, window: tup
     def live_at(shard: int | None, ns: int) -> bool:
         return shard is not None and conn_up.get(shard, False) and ns - last_ws.get(shard, 0) < WS_LIVE_NS
 
-    stats = {"ws_records": 0, "rest_records": 0, "deltas_skipped": 0, "disconnects": 0}
+    stats = {"ws_records": 0, "rest_records": 0, "deltas_skipped": 0, "disconnects": 0,
+             "resync_levels": 0, "resync_top": 0}  # fmt: skip
     cl_last: dict[str, tuple[int, float]] = {}  # coin -> (receive ns, Chainlink price)
     twap_last: dict[str, tuple[int, float]] = {}
 
@@ -313,7 +314,11 @@ def derive_day(cfg: Config, day: str, *, fetch_missing: bool = True, window: tup
                             l2.add(r, ts, cid, name, DELTA, side, p / 10_000, s, src)
             if not rest:
                 ms.resyncs += 1
-                ms.resync_dirty += changed > 0
+                if changed:  # how bad: levels that differed, and whether the best bid/ask was among them
+                    ms.resync_dirty += 1
+                    stats["resync_levels"] += changed
+                    was_top = (max(old[0], default=None), min(old[1], default=None))
+                    stats["resync_top"] += was_top != (max(b.bids, default=None), min(b.asks, default=None))
             ms.n_l2 += changed if store else 0
             return
         b.known = True
@@ -662,13 +667,17 @@ def trial(cfg: Config, minutes: int = 30) -> int:
         f"{name} {size.get(name, 0) * per_day / 1e9:.2f} GB" for name in ("l2", "ticks", "trades", "markets")))  # fmt: skip
     print(f"rows in window: ticks {rep['ticks']:,}, l2 {rep['l2']:,}, trades {rep['trades']:,}; "
           f"deltas skipped {rep['deltas_skipped']:,}; disconnects {rep['disconnects']}")  # fmt: skip
-    hours = sorted(root.glob("raw/ws/*/*.jsonl.zst"))[-3:]
-    if hours:
-        avg = sum(f.stat().st_size for f in hours) / len(hours)
-        print(f"raw websocket log: {avg / 1e9:.2f} GB per compressed hour (last {len(hours)}) -> about {avg * 24 / 1e9:.0f} GB/day")
+    sizes = [f.stat().st_size for f in sorted(root.glob("raw/ws/*/*.jsonl.zst"))[-6:]]
+    sizes = [x for x in sizes if x >= max(sizes) / 2]  # ignore hours the recorder only partly covered
+    if sizes:
+        avg = sum(sizes) / len(sizes)
+        print(f"raw websocket log: {avg / 1e9:.2f} GB per compressed hour ({len(sizes)} full hours) -> about {avg * 24 / 1e9:.0f} GB/day")
     rs, dirty = rep["resyncs"], rep["resync_dirty"]
     print(f"book check (exchange snapshots vs rebuilt book): {rs - dirty:,} of {rs:,} agree"
           + (f" ({100 * (rs - dirty) / rs:.2f}%)" if rs else ""))  # fmt: skip
+    if dirty:
+        print(f"  of the {dirty:,} that differed: {rep['resync_top']:,} differed at the best bid or ask; "
+              f"{rep['resync_levels'] / dirty:.1f} price levels differed on average")  # fmt: skip
     print(f"REST cross-check (timing-sensitive): {rep['rest_checks'] - rep['rest_mismatches']:,} of {rep['rest_checks']:,} agree")
     du = shutil.disk_usage(root)
     print(f"disk: {du.free / 1e9:.0f} GB free of {du.total / 1e9:.0f} GB")

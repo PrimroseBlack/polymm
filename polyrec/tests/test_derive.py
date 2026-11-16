@@ -316,6 +316,7 @@ def test_exchange_snapshots_are_checked_against_the_rebuilt_book(tmp_path):
     read = lambda name: pq.read_table(tmp_path / "derived" / name / f"date={DAY}" / f"{name}.parquet").to_pylist()  # noqa: E731
     (m,) = read("markets")
     assert (m["resyncs"], m["resync_dirty"]) == (2, 1) and (report["resyncs"], report["resync_dirty"]) == (2, 1)
+    assert (report["resync_levels"], report["resync_top"]) == (2, 0)  # two levels differed; best bid stayed 0.50
     l2 = read("l2")
     assert {r["outcome"] for r in l2} == {"Up"}  # the mirrored Down book is not stored
     assert [(r["kind"], r["side"], r["price"], r["size"]) for r in l2] == [
