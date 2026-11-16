@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections import Counter
+from collections import Counter, deque
 
 import httpx
 import orjson
@@ -15,6 +15,68 @@ from .chainlink import AuthFailed, authenticate, parse_polybolt, subscriptions
 from .config import Config, clob_creds, series_slug
 from .derive import parse_ref
 from .gamma import Gamma, parse_market
+
+
+class BookTracker:
+    """Rebuilds books from websocket events and remembers each state, so a REST snapshot can be
+    compared with the book as it stood at the same exchange instant (or the same book hash)."""
+
+    def __init__(self, tokens, keep: int = 50_000):
+        self.books = {t: Book() for t in tokens}
+        self.history = {t: deque(maxlen=keep) for t in tokens}  # (exchange ms, hash, bid, bid size, ask, ask size)
+        self.counts: Counter = Counter()
+        self.snapshots: set[str] = set()
+
+    def _note(self, tok: str, ts: int, book_hash) -> None:
+        self.history[tok].append((ts, book_hash, *self.books[tok].best()))
+
+    def handle(self, data) -> None:
+        for e in data if isinstance(data, list) else (data,):
+            et = e.get("event_type")
+            self.counts[et] += 1
+            ts = int(e.get("timestamp") or 0)
+            if et == "book" and e.get("asset_id") in self.books:
+                tok = e["asset_id"]
+                self.books[tok].snapshot(e.get("bids") or (), e.get("asks") or (), "ws", 0)
+                self.snapshots.add(tok)
+                self._note(tok, ts, e.get("hash"))
+            elif et == "price_change":
+                touched = {}
+                for c in e.get("price_changes") or ():
+                    b = self.books.get(c.get("asset_id"))
+                    if b is not None and b.src:
+                        b.apply(c["side"] == "BUY", c["price"], c["size"], 0)
+                        touched[c["asset_id"]] = c.get("hash")
+                for tok, h in touched.items():
+                    self._note(tok, ts, h)
+
+    def compare(self, rest_book: dict) -> tuple[bool, str, str]:
+        """(agrees, method, detail) for one REST book against the rebuilt book's history."""
+        tok = rest_book["asset_id"]
+        hist = self.history[tok]
+        bids, asks = rest_book.get("bids") or [], rest_book.get("asks") or []
+        rb = max(bids, key=lambda l: float(l["price"]), default=None)
+        ra = min(asks, key=lambda l: float(l["price"]), default=None)
+        want = (float(rb["price"]) if rb else math.nan, float(rb["size"]) if rb else math.nan,
+                float(ra["price"]) if ra else math.nan, float(ra["size"]) if ra else math.nan)  # fmt: skip
+        rts, rhash = int(rest_book.get("timestamp") or 0), rest_book.get("hash")
+        entry = next((h for h in reversed(hist) if rhash and h[1] == rhash), None)
+        method = "hash"
+        if entry is None:
+            entry = next((h for h in reversed(hist) if h[0] <= rts), None)
+            method = "time"
+        if entry is None:
+            return False, "none", f"no websocket state at or before REST time {rts} ({len(hist)} states kept)"
+        got = entry[2:]
+        ok = all(_eq(g, w) for g, w in zip(got, want))
+        newest = hist[-1]
+        detail = (f"rest ts={rts} bid={want[0]}x{want[1]} ask={want[2]}x{want[3]} | ws[{method}] ts={entry[0]} "
+                  f"bid={got[0]}x{got[1]} ask={got[2]}x{got[3]} | ws newest ts={newest[0]} bid={newest[2]} ask={newest[4]}")  # fmt: skip
+        return ok, method, detail
+
+
+def _eq(a: float, b: float) -> bool:
+    return (a != a and b != b) or abs(a - b) < 1e-9
 
 
 async def _current(gamma: Gamma, coin: str, dur: str):
@@ -53,58 +115,60 @@ async def smoke(cfg: Config, seconds: int = 20) -> int:
             check("REST /books", False, repr(e))
 
         # Market websocket: initial subscribe, PING/PONG, dynamic subscribe, book maintenance.
-        counts: Counter = Counter()
-        books = {t: Book() for t in (*btc.tokens, *eth.tokens)}
-        snapshots, pongs = set(), 0
+        tracker = BookTracker((*btc.tokens, *eth.tokens))
+        pongs = 0
+        verdicts: list[tuple[bool, str, str]] = []
         try:
             async with connect(cfg.ws_url, ping_interval=None, max_size=None, open_timeout=15) as ws:
                 await ws.send(orjson.dumps({"assets_ids": list(btc.tokens), "type": "market",
                                             "custom_feature_enabled": True}).decode())  # fmt: skip
+                state = {"next_ping": 0.0}
+
+                async def pump(until: float) -> None:
+                    """Read and apply websocket messages until the given monotonic time."""
+                    nonlocal pongs
+                    while (now := time.monotonic()) < until:
+                        if now >= state["next_ping"]:
+                            await ws.send("PING")
+                            state["next_ping"] = now + 10
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=min(0.5, until - now))
+                        except asyncio.TimeoutError:
+                            continue
+                        if len(msg) <= 8 and msg[:1] not in ("{", "["):
+                            pongs += 1
+                        else:
+                            tracker.handle(orjson.loads(msg))
+
                 t0 = time.monotonic()
-                next_ping, added = 0.0, False
-                while time.monotonic() - t0 < seconds:
-                    now = time.monotonic()
-                    if now >= next_ping:
-                        await ws.send("PING")
-                        next_ping = now + 10
-                    if not added and now - t0 > 5:
-                        await ws.send(orjson.dumps({"assets_ids": list(eth.tokens), "operation": "subscribe",
-                                                    "custom_feature_enabled": True}).decode())  # fmt: skip
-                        added = True
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=1)
-                    except asyncio.TimeoutError:
-                        continue
-                    if msg in ("PONG", b"PONG"):
-                        pongs += 1
-                        continue
-                    data = orjson.loads(msg)
-                    for e in data if isinstance(data, list) else (data,):
-                        et = e.get("event_type")
-                        counts[et] += 1
-                        if et == "book" and e.get("asset_id") in books:
-                            books[e["asset_id"]].snapshot(e.get("bids") or (), e.get("asks") or (), "ws", 0)
-                            snapshots.add(e["asset_id"])
-                        elif et == "price_change":
-                            for c in e.get("price_changes") or ():
-                                b = books.get(c.get("asset_id"))
-                                if b is not None and b.src:
-                                    b.apply(c["side"] == "BUY", c["price"], c["size"], 0)
-                rest = await rest_books(books)
+                await pump(t0 + 5)
+                await ws.send(orjson.dumps({"assets_ids": list(eth.tokens), "operation": "subscribe",
+                                            "custom_feature_enabled": True}).decode())  # fmt: skip
+                await pump(t0 + seconds)
+                # Cross-check against REST three times, reading the websocket throughout so the
+                # rebuilt book has caught up to (and passed) each REST snapshot's instant.
+                for _ in range(3):
+                    task = asyncio.create_task(rest_books(tracker.books))
+                    while not task.done():
+                        await pump(time.monotonic() + 0.1)
+                    rest = task.result()
+                    await pump(time.monotonic() + 1.5)
+                    verdicts += [tracker.compare(r) for r in rest.values()]
+            counts, snapshots = tracker.counts, tracker.snapshots
             check("websocket connect", True, cfg.ws_url)
             check("websocket PING/PONG", pongs > 0, f"{pongs} PONG")
             check("book snapshot on subscribe", set(btc.tokens) <= snapshots)
             check("book snapshot on dynamic subscribe", set(eth.tokens) <= snapshots)
-            check("order-book updates", counts["price_change"] > 0, ", ".join(f"{k}={v}" for k, v in counts.items()))
-            same = 0
-            for tok, b in books.items():
-                r = rest.get(tok)
-                if r and b.src:
-                    bb, _, ba, _ = b.best()
-                    rb = max((float(l["price"]) for l in r["bids"]), default=math.nan)
-                    ra = min((float(l["price"]) for l in r["asks"]), default=math.nan)
-                    same += (bb == rb or (bb != bb and rb != rb)) and (ba == ra or (ba != ba and ra != ra))
-            check("rebuilt book matches REST", same >= len(books) - 1, f"{same} of {len(books)} tops agree")
+            rate = sum(counts.values()) / max(1, seconds)
+            check("order-book updates", counts["price_change"] > 0,
+                  ", ".join(f"{k}={v}" for k, v in counts.items()) + f" (~{rate:.0f} events/s for 2 markets)")  # fmt: skip
+            good = sum(ok for ok, _, _ in verdicts)
+            how = Counter(m for _, m, _ in verdicts)
+            # Advisory: recording is verbatim and does not depend on this; it validates the replay logic.
+            check("rebuilt book matches REST", good == len(verdicts) and bool(verdicts),
+                  f"{good} of {len(verdicts)} comparisons agree (matched by {dict(how)})", required=False)  # fmt: skip
+            for ok, _, detail in [v for v in verdicts if not v[0]][:4]:
+                print("       mismatch:", detail, flush=True)
         except Exception as e:  # noqa: BLE001
             check("websocket connect", False, repr(e))
 

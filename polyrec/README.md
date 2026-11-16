@@ -31,7 +31,7 @@ data/raw ───────▶│ replays the raw logs into Parquet: markets,
 
 The recorder does no parsing: it writes what it receives and nothing else, so a parsing bug can
 never lose data. Tables can be rebuilt from the raw logs at any time while those are retained
-(14 days by default).
+(3 days by default).
 
 ## Install on a VPS
 
@@ -204,8 +204,7 @@ For event-level backtests. Per token (`condition_id` + `outcome`), in receive or
 |---|---|
 | `chainlink` | Live Chainlink price (`btcusd`, …). |
 | `chainlink_twap` | Its 60-second average: what 5m, 15m and 4h markets settle on. |
-| `binance_spot` | 1-second Binance closes for six coins (`BTCUSDT`, …). Hourly markets settle on the Binance 1h candle. |
-| `binance_futures` | Binance futures mark price for HYPE. |
+| `binance_spot` | 1-second Binance closes for six coins (`BTCUSDT`, …; HYPE is not on Binance spot). Hourly markets settle on the Binance 1h candle. |
 
 `snapshot` = 1 marks points the Chainlink feed replayed after a reconnect to fill a gap: their
 `ts_ms` is when they happened, `r` is when they were received.
@@ -228,29 +227,32 @@ delayed (150 ms at the time of writing), which a 1 Hz table cannot model — use
 
 ## Disk
 
-Not yet measured on a real host; the websocket volume is the unknown. Measured so far:
+The order-book feed is heavy: a smoke test on 16 Nov 2026 saw about 1,000 messages a second
+for the BTC and ETH 5-minute markets alone. Raw logs are compressed hourly and deleted
+`raw_retention_days` (default 3) after they have been turned into tables, but several days of
+raw logs plus the growing tables can still fill a small disk.
 
-- REST snapshots in fallback mode (websocket down): ~7.5 MB/minute uncompressed.
-- Routine REST cross-checks: 30× less (~360 MB/day before compression).
+Check after the first hour and again after the first day:
 
-After the first full day, check `du -sh /var/lib/polyrec/raw/* /var/lib/polyrec/derived/*` and
-set `raw_retention_days` and `depth_levels` to fit. Start with at least 80 GB.
+```bash
+du -sh /var/lib/polyrec/raw/* /var/lib/polyrec/derived/* ; df -h /var/lib/polyrec
+```
+
+If it is tight: lower `raw_retention_days`, lower `depth_levels`, record fewer `durations`, or
+attach a larger volume and point `data_dir` at it.
 
 ## What has and has not been verified
-
-This was built in a sandbox that cannot open websocket connections, so:
 
 | Part | Status |
 |---|---|
 | Discovery of all 28 series, REST snapshots, results, the replay into tables | Run against live Polymarket data. |
 | Backfill of results and trades | Run against live Polymarket data. |
-| Websocket client (subscribe, heartbeat, reconnect, stall detection) | Tested against a local stand-in server that follows Polymarket's documented protocol. **Not yet run against Polymarket itself.** |
-| Chainlink feed | Tested against a local stand-in that follows Polymarket's documented protocol (login, subscribe, snapshots, updates). **Not yet run against Polymarket itself.** If it fails, the recorder logs it and carries on. |
-| `clob-creds` | The wallet signature is tested; the request to Polymarket that issues the credentials has **not been run**. |
-| Binance reference feeds | Written from memory of Binance's message formats. **Not yet run.** If one fails, the recorder logs it and carries on. |
-| `seed-kacho` download, `deploy/install.sh` | Not run end to end. |
-
-`polyrec smoke` exercises the unverified feeds in under a minute.
+| Market websocket (subscribe, heartbeat, snapshots, adding markets on the fly) | Passed `polyrec smoke` against Polymarket from a Hetzner server in Helsinki. Reconnect and stall handling are tested only against a local stand-in. |
+| Chainlink feed and `clob-creds` | Passed `polyrec smoke` against Polymarket, with credentials from a throwaway wallet. |
+| Binance spot feed | Passed `polyrec smoke`. |
+| Order books rebuilt from websocket messages equal Polymarket's REST snapshots | **Not yet confirmed.** `smoke` reports this as an advisory line; `rest_mismatches` in the markets table tracks it per market. Raw logs are verbatim, so tables can be rebuilt if the replay logic needs a fix. |
+| A full day of unattended recording, and the daily derive at real data volumes | **Not yet run.** |
+| `seed-kacho` download | Not run end to end. |
 
 ## Development
 

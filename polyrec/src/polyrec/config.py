@@ -32,15 +32,14 @@ class AuxFeed:
     stale_seconds: float = 60.0
 
 
-# Reference prices. NOT verified from the build sandbox (it cannot open websockets);
-# `polyrec smoke` checks them on the host. Remove or edit in polyrec.toml as needed.
+# Binance 1-second closes as a second reference price (hourly markets settle on Binance candles).
+# HYPE is not on Binance spot; its price comes from the Chainlink feed.
 _BINANCE_SPOT = "btcusdt ethusdt solusdt xrpusdt dogeusdt bnbusdt".split()
 DEFAULT_AUX = [
     AuxFeed(
         name="binance_spot",
         url="wss://data-stream.binance.vision/stream?streams=" + "/".join(f"{s}@kline_1s" for s in _BINANCE_SPOT),
     ),
-    AuxFeed(name="binance_futures", url="wss://fstream.binance.com/stream?streams=hypeusdt@markPrice@1s"),
 ]
 
 
@@ -59,7 +58,7 @@ class Config:
     rest_fallback_after: float = 5.0  # seconds without websocket data before falling back
     ws_stale_seconds: float = 30.0  # reconnect after this long without data
     depth_levels: int = 10  # order-book levels per side kept in the 1 Hz table
-    raw_retention_days: int = 14  # raw logs older than this are pruned once derived
+    raw_retention_days: int = 3  # raw logs older than this are pruned once derived
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
@@ -101,14 +100,15 @@ def load_config(path: str | Path | None = None) -> Config:
     return cfg
 
 
-def load_env_file(path: str | Path) -> bool:
+def load_env_file(path: str | Path, quiet: bool = False) -> bool:
     """Read KEY=VALUE lines into the environment (existing variables win). True if the file was read."""
     try:
         text = Path(path).read_text()
     except FileNotFoundError:
         return False
     except PermissionError:
-        log.warning("cannot read %s (permission denied): credentials in it are not available", path)
+        if not quiet:
+            log.warning("cannot read %s (permission denied): credentials in it are not available", path)
         return False
     for line in text.splitlines():
         line = line.strip()

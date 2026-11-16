@@ -58,8 +58,8 @@ def main(argv=None) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
     cfg = load_config(a.config)
-    for env_path in (cfg.env_file, "polyrec.env"):
-        load_env_file(env_path)
+    load_env_file(cfg.env_file)
+    load_env_file("polyrec.env", quiet=True)  # convenience for running from a checkout
 
     if a.cmd == "record":
         from .recorder import Recorder
