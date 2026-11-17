@@ -29,7 +29,7 @@ data/raw ───────▶│ replays the raw logs into Parquet: markets,
                  └───────────────────────────────────────────────────────────────┘
 ```
 
-The markets are spread over several websocket connections (`ws_connections`, default 4):
+The markets are spread over several websocket connections (`ws_connections`, default 8):
 Polymarket drops a client that falls behind on a busy connection, and with the load split a
 drop interrupts only that connection's markets, which REST snapshots cover until it is back.
 
@@ -218,14 +218,51 @@ the exchange timestamp, `src` 0 websocket / 1 REST. `polyrec.replay.replay(rows)
 `snapshot` = 1 marks points the Chainlink feed replayed after a reconnect to fill a gap: their
 `ts_ms` is when they happened, `r` is when they were received.
 
+### Getting the data onto your own computer
+
+The tables are plain Parquet files, so copying the folder is all it takes. From your own
+machine (not the server), leaving out the large order-book-change table:
+
+```bash
+mkdir -p ~/polyrec-data && rsync -av --exclude 'l2/' root@YOUR_SERVER_IP:/var/lib/polyrec/derived/ ~/polyrec-data/derived/
+```
+
+Run it again any time: only new files are transferred. Add the history from `polyrec backfill`
+and `polyrec seed-kacho`, or one day of `l2`, the same way:
+
+```bash
+rsync -av root@YOUR_SERVER_IP:/var/lib/polyrec/backfill root@YOUR_SERVER_IP:/var/lib/polyrec/seed ~/polyrec-data/
+```
+
+```bash
+rsync -av root@YOUR_SERVER_IP:/var/lib/polyrec/derived/l2/date=2026-11-16 ~/polyrec-data/derived/l2/
+```
+
 ### Querying
 
+[DuckDB](https://duckdb.org) reads the files in place; so do pandas and polars. Run these from
+`~/polyrec-data` (or `/var/lib/polyrec` on the server).
+
 ```sql
--- DuckDB: implied probability of Up for BTC 5m markets, with the result
-SELECT t.ts_utc, t.sec, (t.bu + t.au) / 2 AS p_up, m.outcome
-FROM read_parquet('data/derived/ticks/*/ticks.parquet', hive_partitioning = true) t
-JOIN read_parquet('data/derived/markets/*/markets.parquet', hive_partitioning = true) m USING (condition_id)
-WHERE t.coin = 'btc' AND t.duration = '5m' AND t.date = '2026-11-16';
+-- What has been recorded: markets and seconds of data per series
+SELECT coin, duration, count(*) AS markets, sum(n_ticks_window) AS seconds_recorded
+FROM read_parquet('derived/markets/*/markets.parquet', hive_partitioning = true)
+GROUP BY ALL ORDER BY duration, coin;
+```
+
+```sql
+-- Per-second implied probability of Up for BTC 5m markets, with Chainlink price and the result
+SELECT t.ts_utc, t.sec, (t.bu + t.au) / 2 AS p_up, t.cl, m.price_to_beat, m.outcome
+FROM read_parquet('derived/ticks/*/ticks.parquet', hive_partitioning = true) t
+JOIN read_parquet('derived/markets/*/markets.parquet', hive_partitioning = true) m USING (condition_id)
+WHERE t.coin = 'btc' AND t.duration = '5m' AND t.sec >= 0
+ORDER BY t.ts_utc;
+```
+
+```python
+import duckdb
+ticks = duckdb.sql("SELECT * FROM read_parquet('derived/ticks/*/ticks.parquet', hive_partitioning = true) "
+                   "WHERE coin = 'btc' AND duration = '5m' AND date = '2026-11-16'").df()
 ```
 
 ## Fees, for backtests

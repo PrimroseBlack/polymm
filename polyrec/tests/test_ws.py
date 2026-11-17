@@ -119,7 +119,7 @@ def test_stalled_connection_is_dropped(tmp_path):
         async with serve(silent, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             lg = RawLog(tmp_path, "ws")
-            ws = MarketWS(f"ws://127.0.0.1:{port}", lg, stale_seconds=0.5)
+            ws = MarketWS(f"ws://127.0.0.1:{port}", lg, dead_seconds=0.5)
             ws.set_tokens({"A"})
             task = asyncio.create_task(ws.run())
             await wait_for(lambda: ws.conn_id >= 2)
@@ -129,7 +129,7 @@ def test_stalled_connection_is_dropped(tmp_path):
 
     asyncio.run(go())
     why = [r["why"] for r in records(tmp_path) if r.get("ctl") == "disconnected"]
-    assert "no market data" in why[0]
+    assert "no frames" in why[0]
 
 
 def test_aux_feed_backoff_keeps_growing(tmp_path, monkeypatch):
@@ -170,7 +170,7 @@ def test_feed_spreads_tokens_over_connections_and_tags_records(tmp_path):
             task = asyncio.create_task(feed.run())
             await wait_for(lambda: feed.n_msgs >= 2 and feed.connected)
             assert feed.unhealthy_tokens(5) == set() and feed.n_connects == 2 and feed.n_bytes > 0
-            feed.conns[2].last_data_ns = 0  # pretend connection 2 went quiet
+            feed.conns[2].last_rx_ns = 0  # pretend connection 2 stopped answering
             assert feed.unhealthy_tokens(5) == {"C"}
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -196,8 +196,26 @@ def test_markets_of_one_coin_land_on_different_connections(tmp_path):
     rec = Recorder(cfg)
     mk = lambda coin, dur: Market("c", "e", "m", "s", coin, dur, 0, 1, "u", "d")  # noqa: E731
     for coin in ("btc", "eth"):
-        assert sorted(rec.shard_of(mk(coin, d)) for d in cfg.durations) == [0, 1, 2, 3]
+        assert len({rec.shard_of(mk(coin, d)) for d in cfg.durations}) == 4  # four different connections
     load = [0] * cfg.ws_connections
     for coin, dur in cfg.series:
         load[rec.shard_of(mk(coin, dur))] += 1
-    assert load == [7, 7, 7, 7]
+    assert load == [4, 4, 4, 4, 3, 3, 3, 3]
+
+
+def test_health_of_busy_and_quiet_connections(tmp_path):
+    ws = MarketWS("ws://unused", RawLog(tmp_path, "ws"))
+    now = time.time_ns()
+    assert not ws.healthy(3)  # not connected
+    ws.connected, ws.last_rx_ns, ws.last_data_ns = True, now, now - 8 * 10**9
+    # Quiet connection (no recent message rate): 8 s without data is normal while PONGs arrive.
+    assert not ws.busy and ws.healthy(3)
+    ws.last_rx_ns = now - 14 * 10**9  # ... but not once PING replies stop (10 s interval + 3 s)
+    assert not ws.healthy(3)
+    # Busy connection: a minute averaging over one message a second.
+    ws.last_rx_ns = now
+    ws._samples.extend(range(0, 6100, 100))
+    ws.n_msgs = 6100
+    assert ws.busy and not ws.healthy(3)  # 8 s of silence on a busy connection is a stall
+    ws.last_data_ns = now - 10**9
+    assert ws.healthy(3)

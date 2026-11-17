@@ -5,6 +5,7 @@ import asyncio
 import logging
 import random
 import time
+from collections import deque
 
 import orjson
 from websockets.asyncio.client import connect
@@ -22,9 +23,11 @@ class MarketWS:
     """
 
     def __init__(self, url: str, rawlog: RawLog, *, shard: int = 0, stale_seconds: float = 30.0,
-                 ping_interval: float = 10.0):  # fmt: skip
+                 ping_interval: float = 10.0, dead_seconds: float = 25.0):  # fmt: skip
         self.url, self.log, self.shard = url, rawlog, shard
+        self.dead_seconds = dead_seconds  # no frame at all (not even PONG) for this long: reconnect
         self.n_bytes = 0
+        self._samples: deque[int] = deque(maxlen=61)  # n_msgs once a second, for the last minute
         self.stale_seconds, self.ping_interval = stale_seconds, ping_interval
         self.desired: set[str] = set()
         self.subscribed: set[str] = set()
@@ -41,8 +44,20 @@ class MarketWS:
             self.desired = set(tokens)
             self._wake.set()
 
+    @property
+    def busy(self) -> bool:
+        """Averaged at least one message a second over the last minute, so silence means trouble."""
+        return len(self._samples) > 1 and self.n_msgs - self._samples[0] >= len(self._samples) - 1
+
     def healthy(self, max_age: float) -> bool:
-        return self.connected and time.time_ns() - self.last_data_ns < max_age * 1e9
+        """Delivering right now? A busy connection must have data within max_age; a quiet one
+        (thinly traded markets only) is judged by its PING replies instead."""
+        if not self.connected:
+            return False
+        now = time.time_ns()
+        if self.busy:
+            return now - self.last_data_ns < max_age * 1e9
+        return now - self.last_rx_ns < (self.ping_interval + max_age) * 1e9
 
     def ctl(self, kind: str, **kw) -> None:
         self.log.record(time.time_ns(), c=self.conn_id, s=self.shard, ctl=kind, **kw)
@@ -82,6 +97,7 @@ class MarketWS:
             self.conn_id += 1
             self.n_connects += 1
             self.last_rx_ns = self.last_data_ns = time.time_ns()
+            self._samples.clear()
             self.connected = True
             self.ctl("connected")
             ids = sorted(self.desired)
@@ -124,6 +140,9 @@ class MarketWS:
             if now >= next_hb:
                 self.ctl("hb")
                 next_hb = now + 5
+            if not self._samples or now - self._sampled >= 1:
+                self._samples.append(self.n_msgs)
+                self._sampled = now
             self._wake.clear()
             add, rem = self.desired - self.subscribed, self.subscribed - self.desired
             if add:
@@ -139,10 +158,10 @@ class MarketWS:
                 self.subscribed -= rem
                 self.ctl("unsubscribe", ids=ids)
             ns = time.time_ns()
-            if ns - self.last_rx_ns > 25e9:
-                raise TimeoutError("no frames (not even PONG) for 25s")
-            if self.subscribed and ns - self.last_data_ns > self.stale_seconds * 1e9:
-                raise TimeoutError(f"no market data for {self.stale_seconds:.0f}s")
+            if ns - self.last_rx_ns > self.dead_seconds * 1e9:
+                raise TimeoutError(f"no frames (not even PONG) for {self.dead_seconds:.0f}s")
+            if self.subscribed and self.busy and ns - self.last_data_ns > self.stale_seconds * 1e9:
+                raise TimeoutError(f"no market data for {self.stale_seconds:.0f}s on a busy connection")
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=1.0)
             except asyncio.TimeoutError:

@@ -57,7 +57,7 @@ class Config:
     rest_fallback_interval: float = 1.0
     rest_fallback_after: float = 3.0  # seconds without websocket data before falling back
     ws_stale_seconds: float = 30.0  # reconnect after this long without data
-    ws_connections: int = 4  # market websocket connections the markets are spread across
+    ws_connections: int = 8  # market websocket connections the markets are spread across
     depth_levels: int = 10  # order-book levels per side kept in the 1 Hz table
     l2_both_outcomes: bool = False  # also store the Down book's changes in l2 (it mirrors Up)
     l2_retention_days: int = 0  # keep the l2 table only this many days back; 0 keeps it forever
