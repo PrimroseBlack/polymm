@@ -49,7 +49,7 @@ def fetch_trades(client: httpx.Client, data_api_url: str, condition_id: str) -> 
         params = {"condition": condition_id, "limit": 500}
         if cursor:
             params["cursor"] = cursor
-        body = get(client, f"{data_api_url}/v2/trades", params).json()
+        body = get(client, f"{data_api_url}/v2/trades", params, retries=9).json()
         out.extend(body.get("data") or [])
         page = body.get("pagination") or {}
         cursor = page.get("next_cursor")
@@ -65,6 +65,7 @@ def backfill(cfg: Config, start: str, end: str, coins=None, durations=None, *, t
     days = [d for d in day_range(start, end) if day_start(d) + 86400 + 4 * 3600 <= time.time()]
     if len(days) < len(day_range(start, end)):
         log.warning("skipping days that are not complete yet (on or after %s)", iso(today)[:10])
+    failed: list[str] = []
     with httpx.Client(timeout=30, headers={"User-Agent": "polyrec"}) as client, ThreadPoolExecutor(4) as pool:
         for coin in coins:
             for dur in durations:
@@ -90,12 +91,20 @@ def backfill(cfg: Config, start: str, end: str, coins=None, durations=None, *, t
                     n_tr = 0
                     if trades:
                         sink = Sink(tpath, BF_TRADES)
-                        results = pool.map(lambda me: fetch_trades(client, cfg.data_api_url, me[0].condition_id), markets)
-                        for (m, _), rows in zip(markets, results):
-                            for t in sorted(rows, key=lambda t: t.get("timestamp") or 0):
-                                sink.add(t.get("timestamp"), m.condition_id, coin, dur, t.get("outcome"), t.get("side"),
-                                         _f(t.get("price")), _f(t.get("size")), t.get("token_id"),
-                                         t.get("transaction_hash"), t.get("proxy_wallet"))  # fmt: skip
+                        try:
+                            results = pool.map(lambda me: fetch_trades(client, cfg.data_api_url, me[0].condition_id), markets)
+                            for (m, _), rows in zip(markets, results):
+                                for t in sorted(rows, key=lambda t: t.get("timestamp") or 0):
+                                    sink.add(t.get("timestamp"), m.condition_id, coin, dur, t.get("outcome"), t.get("side"),
+                                             _f(t.get("price")), _f(t.get("size")), t.get("token_id"),
+                                             t.get("transaction_hash"), t.get("proxy_wallet"))  # fmt: skip
+                        except Exception as e:  # noqa: BLE001 - one bad day must not stop the rest
+                            sink.abort()
+                            failed.append(f"{day} {coin} {dur}")
+                            log.error("%s %s %s: trades failed, will be retried on the next run: %s: %s",
+                                      day, coin, dur, type(e).__name__, str(e)[:300])  # fmt: skip
+                            time.sleep(5)
+                            continue
                         sink.close()
                         n_tr = sink.rows
                     sink = Sink(mpath, BF_MARKETS)  # written last: its presence marks the day complete
@@ -106,7 +115,9 @@ def backfill(cfg: Config, start: str, end: str, coins=None, durations=None, *, t
                                  _f(emd.get("finalPrice")), _f(m0.get("volumeNum")), m0.get("resolutionSource"))  # fmt: skip
                     sink.close()
                     log.info("%s %s %s: %d markets, %d trades", day, coin, dur, len(markets), n_tr)
-    return 0
+    if failed:
+        log.error("%d series-days failed and are left for the next run, e.g. %s", len(failed), ", ".join(failed[:5]))
+    return 1 if failed else 0
 
 
 KACHO = "kachoio/polymarket-5-minute-crypto-up-down-markets"

@@ -108,3 +108,45 @@ def test_finalizer_logs_result_then_settled_reading(tmp_path, monkeypatch):
     assert asked == [20, 60, 120, 1800]
     finals = [x for x in iter_raw(tmp_path, "meta", 999_000 * 10**9, 1_010_000 * 10**9) if x["k"] == "final"]
     assert [x["ev"]["markets"][0]["volumeNum"] for x in finals] == [120, 1800]
+
+
+def test_backfill_skips_a_failing_day_and_carries_on(tmp_path, monkeypatch):
+    from polyrec import backfill as bf
+
+    ev = load("event_btc_5m_open.json")
+    ev["markets"][0].update(closed=True, outcomePrices='["1", "0"]')
+    start = 1_790_000_000 // 86400 * 86400  # some past UTC midnight
+    days = [bf.iso(start + i * 86400)[:10] for i in range(2)]
+
+    def events_for(client, url, sid, t0, t1):
+        e = json.loads(json.dumps(ev))
+        e["markets"][0].update(eventStartTime=bf.iso(t0 + 600), endDate=bf.iso(t0 + 900), conditionId=f"0x{t0}")
+        return [e]
+
+    calls = []
+
+    def trades_for(client, url, cid):
+        calls.append(cid)
+        if cid == f"0x{start}":
+            raise RuntimeError("HTTP 500 from data-api")
+        return [{"timestamp": 5, "outcome": "Up", "side": "BUY", "price": 0.5, "size": 2, "token_id": "t", "transaction_hash": "h", "proxy_wallet": "w"}]
+
+    class R:
+        def json(self):
+            return [{"id": 1}]
+
+    monkeypatch.setattr(bf, "get", lambda *a, **k: R())
+    monkeypatch.setattr(bf, "list_events", events_for)
+    monkeypatch.setattr(bf, "fetch_trades", trades_for)
+    monkeypatch.setattr(bf.time, "sleep", lambda s: None)
+    cfg = Config(data_dir=tmp_path)
+    assert bf.backfill(cfg, days[0], days[1], ["btc"], ["5m"]) == 1
+    tdir = tmp_path / "backfill" / "trades" / "coin=btc" / "duration=5m"
+    assert sorted(p.name for p in tdir.iterdir()) == [f"{days[1]}.parquet"]  # no partial file for the bad day
+    mdir = tmp_path / "backfill" / "markets" / "coin=btc" / "duration=5m"
+    assert sorted(p.name for p in mdir.iterdir()) == [f"{days[1]}.parquet"]
+    # The next run retries only the day that failed.
+    calls.clear()
+    monkeypatch.setattr(bf, "fetch_trades", lambda c, u, cid: [])
+    assert bf.backfill(cfg, days[0], days[1], ["btc"], ["5m"]) == 0
+    assert len(list(tdir.iterdir())) == 2

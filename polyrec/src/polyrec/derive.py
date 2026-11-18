@@ -113,6 +113,11 @@ class Sink:
         self.writer.close()
         self.tmp.replace(self.path)
 
+    def abort(self) -> None:
+        """Discard what was written; the final file never appears."""
+        self.writer.close()
+        self.tmp.unlink(missing_ok=True)
+
 
 class BookS(Book):
     """Book plus the bookkeeping needed to decide whether it can be trusted at a given instant."""
