@@ -45,6 +45,12 @@ def main(argv=None) -> int:
     s = sub.add_parser("seed-kacho", help="download Kacho's Mar-May 2026 dataset as a historical seed")
     s.add_argument("--markets-only", action="store_true")
 
+    s = sub.add_parser("backtest", help="replay rule and ML strategies against the recorded order book")
+    s.add_argument("--coin", default="btc")
+    s.add_argument("--duration", default="5m", choices=["5m", "15m", "1h", "4h"])
+    s.add_argument("--latency", type=int, default=1, help="seconds between decision and execution (default 1)")
+    s.add_argument("--shares", type=float, default=10.0, help="order size in shares (default 10)")
+
     s = sub.add_parser("stats", help="win rates and buy-and-hold P&L per market type, from the backfill")
     s.add_argument("coins", nargs="*", help="coins to include, e.g. btc eth (default: all)")
 
@@ -116,6 +122,10 @@ def main(argv=None) -> int:
         from .backfill import backfill
 
         return backfill(cfg, a.start, a.end, a.coins, a.durations, trades=not a.no_trades)
+    if a.cmd == "backtest":
+        from .backtest import backtest
+
+        return backtest(cfg, a.coin.lower(), a.duration, a.latency, a.shares)
     if a.cmd == "stats":
         from .stats import stats
 
