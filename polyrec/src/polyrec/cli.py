@@ -45,6 +45,9 @@ def main(argv=None) -> int:
     s = sub.add_parser("seed-kacho", help="download Kacho's Mar-May 2026 dataset as a historical seed")
     s.add_argument("--markets-only", action="store_true")
 
+    s = sub.add_parser("stats", help="win rates and buy-and-hold P&L per market type, from the backfill")
+    s.add_argument("coins", nargs="*", help="coins to include, e.g. btc eth (default: all)")
+
     s = sub.add_parser("clob-creds", help="create the API credentials the Chainlink feed needs")
     s.add_argument("--out", default="polyrec.env", help="file to write (default: ./polyrec.env)")
     g = s.add_mutually_exclusive_group()
@@ -113,6 +116,10 @@ def main(argv=None) -> int:
         from .backfill import backfill
 
         return backfill(cfg, a.start, a.end, a.coins, a.durations, trades=not a.no_trades)
+    if a.cmd == "stats":
+        from .stats import stats
+
+        return stats(cfg, a.coins)
     if a.cmd == "clob-creds":
         from .creds import clob_creds_cmd
 

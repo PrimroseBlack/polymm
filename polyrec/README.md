@@ -128,6 +128,7 @@ about once a second each. They appear as `cl` and `cl_twap` in `ticks` and as ro
 | `polyrec backfill --start D --end D` | Downloads results and trades for past markets. `--coins`, `--durations`, `--no-trades` narrow it. Resumable. |
 | `polyrec seed-kacho` | Downloads Kacho's dataset (~725 MB) into `data/seed/kacho/`. |
 | `polyrec clob-creds` | Creates the API credentials the Chainlink feed needs. |
+| `polyrec stats [coins]` | From the backfill: how often Up won per market type, and the combined result of every buy trade held to the end. A market-wide baseline, not a strategy. |
 
 ## The data
 
